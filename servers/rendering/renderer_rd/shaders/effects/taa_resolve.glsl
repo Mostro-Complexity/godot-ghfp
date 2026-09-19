@@ -54,6 +54,10 @@ layout(push_constant, std430) uniform Params {
 	vec2 resolution;
 	float disocclusion_threshold; // 0.1 / max(params.resolution.x, params.resolution.y)
 	float variance_dynamic;
+	float reactive_edge_scale;
+	float reactive_edge_max_weight;
+	float pad0;
+	float pad1;
 }
 params;
 
@@ -304,11 +308,43 @@ float luminance(vec3 color) {
 // This is "velocity disocclusion" as described by https://www.elopezr.com/temporal-aa-and-the-quest-for-the-holy-trail/.
 // We use texel space, so our scale and threshold differ.
 float get_factor_disocclusion(vec2 uv_reprojected, vec2 velocity) {
-	vec2 velocity_previous = imageLoad(last_velocity_buffer, ivec2(uv_reprojected * params.resolution)).xy;
+	ivec2 previous_position = clamp(ivec2(uv_reprojected * params.resolution),
+		ivec2(0), ivec2(params.resolution) - ivec2(1));
+	vec2 velocity_previous = imageLoad(last_velocity_buffer, previous_position).xy;
 	vec2 velocity_texels = velocity * params.resolution;
 	vec2 prev_velocity_texels = velocity_previous * params.resolution;
 	float disocclusion = length(prev_velocity_texels - velocity_texels) - params.disocclusion_threshold;
 	return clamp(disocclusion * DISOCCLUSION_SCALE, 0.0, 1.0);
+}
+
+// Alpha-tested foliage, chain-link and other sub-pixel silhouettes can expose background in one
+// frame and foreground in the next. A correct per-vertex motion vector cannot describe that
+// coverage change, so retaining 15/16 history produces the characteristic leaf-card trail. Build
+// a conservative reactive value only where the local velocity field is discontinuous and the
+// current 3x3 neighbourhood contains a visible luminance edge. Interior pixels continue to use
+// the full 16-sample accumulation budget.
+float get_factor_reactive_edge(uvec2 pos_group, uvec2 pos_screen, vec2 velocity) {
+	if (params.reactive_edge_scale <= 0.0) {
+		return 0.0;
+	}
+	float maximum_velocity_delta = 0.0;
+	float minimum_luminance = FLT_MAX;
+	float maximum_luminance = 0.0;
+	for (int sample_index = 0; sample_index < 9; sample_index++) {
+		ivec2 sample_position = clamp(ivec2(pos_screen) + kOffsets3x3[sample_index],
+			ivec2(0), ivec2(params.resolution) - ivec2(1));
+		vec2 neighbour_velocity = imageLoad(velocity_buffer, sample_position).xy;
+		maximum_velocity_delta = max(maximum_velocity_delta,
+			length(neighbour_velocity - velocity) * max(params.resolution.x, params.resolution.y));
+		float sample_luminance = luminance(load_color(pos_group + kOffsets3x3[sample_index]));
+		minimum_luminance = min(minimum_luminance, sample_luminance);
+		maximum_luminance = max(maximum_luminance, sample_luminance);
+	}
+	float velocity_edge = smoothstep(0.12, 1.20, maximum_velocity_delta);
+	float relative_contrast = (maximum_luminance - minimum_luminance) /
+		max(maximum_luminance, 0.05);
+	float visible_edge = smoothstep(0.06, 0.42, relative_contrast);
+	return clamp(velocity_edge * visible_edge * params.reactive_edge_scale, 0.0, 1.0);
 }
 
 vec3 temporal_antialiasing(uvec2 pos_group_top_left, uvec2 pos_group, uvec2 pos_screen, vec2 uv, sampler2D tex_history) {
@@ -337,9 +373,12 @@ vec3 temporal_antialiasing(uvec2 pos_group_top_left, uvec2 pos_group, uvec2 pos_
 
 		// Increase blend factor when there is disocclusion (fixes a lot of the remaining ghosting).
 		float factor_disocclusion = get_factor_disocclusion(uv_reprojected, velocity);
+		float factor_reactive_edge = get_factor_reactive_edge(pos_group, pos_screen, velocity);
 
 		// Add to the blend factor
 		blend_factor = clamp(blend_factor + factor_screen + factor_disocclusion, 0.0, 1.0);
+		blend_factor = max(blend_factor, mix(RPC_16,
+			params.reactive_edge_max_weight, factor_reactive_edge));
 	}
 
 	// Resolve

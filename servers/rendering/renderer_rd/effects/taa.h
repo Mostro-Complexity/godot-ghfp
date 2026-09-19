@@ -48,6 +48,10 @@ private:
 		float resolution_height;
 		float disocclusion_threshold;
 		float variance_dynamic;
+		float reactive_edge_scale;
+		float reactive_edge_max_weight;
+		float pad0;
+		float pad1;
 	};
 
 	TaaResolveShaderRD taa_shader;
