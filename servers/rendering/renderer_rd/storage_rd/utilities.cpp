@@ -261,6 +261,10 @@ bool Utilities::has_os_feature(const String &p_feature) const {
 		return false;
 	}
 
+	if (p_feature == "ghfp_taa_material_reactive_mask") {
+		return true;
+	}
+
 	if (p_feature == "rgtc" && RD::get_singleton()->texture_is_format_supported_for_usage(RD::DATA_FORMAT_BC5_UNORM_BLOCK, RD::TEXTURE_USAGE_SAMPLING_BIT)) {
 		return true;
 	}
