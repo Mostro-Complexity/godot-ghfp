@@ -36,6 +36,12 @@
 class CameraAttributes : public Resource {
 	GDCLASS(CameraAttributes, Resource);
 
+public:
+	enum AutoExposureMeteringMode {
+		AUTO_EXPOSURE_METERING_AVERAGE,
+		AUTO_EXPOSURE_METERING_HISTOGRAM,
+	};
+
 private:
 	RID camera_attributes;
 
@@ -52,7 +58,14 @@ protected:
 	float auto_exposure_max = 64.0;
 	float auto_exposure_speed = 0.5;
 	float auto_exposure_scale = 0.4;
+	AutoExposureMeteringMode auto_exposure_metering_mode = AUTO_EXPOSURE_METERING_AVERAGE;
+	float auto_exposure_histogram_low_percentile = 0.1;
+	float auto_exposure_histogram_high_percentile = 0.9;
+	float auto_exposure_histogram_min_ev = -12.0;
+	float auto_exposure_histogram_max_ev = 16.0;
+	float auto_exposure_histogram_center_weight = 0.65;
 	virtual void _update_auto_exposure() {}
+	void _update_auto_exposure_metering();
 
 public:
 	virtual RID get_rid() const override;
@@ -69,10 +82,24 @@ public:
 	float get_auto_exposure_speed() const;
 	void set_auto_exposure_scale(float p_auto_exposure_scale);
 	float get_auto_exposure_scale() const;
+	void set_auto_exposure_metering_mode(AutoExposureMeteringMode p_mode);
+	AutoExposureMeteringMode get_auto_exposure_metering_mode() const;
+	void set_auto_exposure_histogram_low_percentile(float p_percentile);
+	float get_auto_exposure_histogram_low_percentile() const;
+	void set_auto_exposure_histogram_high_percentile(float p_percentile);
+	float get_auto_exposure_histogram_high_percentile() const;
+	void set_auto_exposure_histogram_min_ev(float p_ev);
+	float get_auto_exposure_histogram_min_ev() const;
+	void set_auto_exposure_histogram_max_ev(float p_ev);
+	float get_auto_exposure_histogram_max_ev() const;
+	void set_auto_exposure_histogram_center_weight(float p_weight);
+	float get_auto_exposure_histogram_center_weight() const;
 
 	CameraAttributes();
 	~CameraAttributes();
 };
+
+VARIANT_ENUM_CAST(CameraAttributes::AutoExposureMeteringMode);
 
 class CameraAttributesPractical : public CameraAttributes {
 	GDCLASS(CameraAttributesPractical, CameraAttributes);
