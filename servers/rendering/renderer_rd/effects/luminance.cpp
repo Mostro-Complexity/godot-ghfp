@@ -67,6 +67,15 @@ Luminance::Luminance(bool p_prefer_raster_effects) {
 		for (int i = 0; i < LUMINANCE_REDUCE_FRAGMENT_MAX; i++) {
 			luminance_reduce_raster.pipelines[i].clear();
 		}
+
+		Vector<String> luminance_histogram_modes;
+		luminance_histogram_modes.push_back("\n#define BUILD_HISTOGRAM\n");
+		luminance_histogram_modes.push_back("\n#define RESOLVE_HISTOGRAM\n");
+		luminance_histogram.shader.initialize(luminance_histogram_modes);
+		luminance_histogram.shader_version = luminance_histogram.shader.version_create();
+		for (int i = 0; i < LUMINANCE_HISTOGRAM_MAX; i++) {
+			luminance_histogram.pipelines[i] = RD::get_singleton()->compute_pipeline_create(luminance_histogram.shader.version_get_shader(luminance_histogram.shader_version, i));
+		}
 	}
 }
 
@@ -75,6 +84,7 @@ Luminance::~Luminance() {
 		luminance_reduce_raster.shader.version_free(luminance_reduce_raster.shader_version);
 	} else {
 		luminance_reduce.shader.version_free(luminance_reduce.shader_version);
+		luminance_histogram.shader.version_free(luminance_histogram.shader_version);
 	}
 }
 
@@ -117,6 +127,10 @@ void Luminance::LuminanceBuffers::configure(RenderSceneBuffersRD *p_render_buffe
 			break;
 		}
 	}
+
+	if (!prefer_raster_effects) {
+		histogram = RD::get_singleton()->storage_buffer_create(256 * sizeof(uint32_t));
+	}
 }
 
 void Luminance::LuminanceBuffers::free_data() {
@@ -128,6 +142,11 @@ void Luminance::LuminanceBuffers::free_data() {
 	if (current.is_valid()) {
 		RD::get_singleton()->free_rid(current);
 		current = RID();
+	}
+
+	if (histogram.is_valid()) {
+		RD::get_singleton()->free_rid(histogram);
+		histogram = RID();
 	}
 }
 
@@ -155,7 +174,7 @@ RID Luminance::get_current_luminance_buffer(Ref<RenderSceneBuffersRD> p_render_b
 	return RID();
 }
 
-void Luminance::luminance_reduction(RID p_source_texture, const Size2i p_source_size, Ref<LuminanceBuffers> p_luminance_buffers, float p_min_luminance, float p_max_luminance, float p_adjust, bool p_set) {
+void Luminance::luminance_reduction(RID p_source_texture, const Size2i p_source_size, Ref<LuminanceBuffers> p_luminance_buffers, float p_min_luminance, float p_max_luminance, float p_adjust, bool p_set, int p_metering_mode, float p_low_percentile, float p_high_percentile, float p_min_ev, float p_max_ev, float p_center_weight) {
 	UniformSetCacheRD *uniform_set_cache = UniformSetCacheRD::get_singleton();
 	ERR_FAIL_NULL(uniform_set_cache);
 	MaterialStorage *material_storage = MaterialStorage::get_singleton();
@@ -164,7 +183,49 @@ void Luminance::luminance_reduction(RID p_source_texture, const Size2i p_source_
 	// setup our uniforms
 	RID default_sampler = material_storage->sampler_rd_get_default(RS::CANVAS_ITEM_TEXTURE_FILTER_LINEAR, RS::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
 
-	if (prefer_raster_effects) {
+	if (!prefer_raster_effects && p_metering_mode == 1) {
+		LuminanceHistogramPushConstant push_constant;
+		memset(&push_constant, 0, sizeof(LuminanceHistogramPushConstant));
+		push_constant.source_size[0] = p_source_size.x;
+		push_constant.source_size[1] = p_source_size.y;
+		push_constant.sample_stride = MAX(1, int(Math::ceil(Math::sqrt(double(p_source_size.x) * double(p_source_size.y) / (512.0 * 512.0)))));
+		push_constant.bin_count = 256;
+		push_constant.min_ev = p_min_ev;
+		push_constant.max_ev = p_max_ev;
+		push_constant.low_percentile = CLAMP(p_low_percentile, 0.0f, 1.0f);
+		push_constant.high_percentile = CLAMP(p_high_percentile, push_constant.low_percentile, 1.0f);
+		push_constant.center_weight = CLAMP(p_center_weight, 0.0f, 1.0f);
+		push_constant.exposure_adjust = p_set ? 1.0f : p_adjust;
+		push_constant.min_luminance = p_min_luminance;
+		push_constant.max_luminance = p_max_luminance;
+
+		RD::get_singleton()->buffer_clear(p_luminance_buffers->histogram, 0, 256 * sizeof(uint32_t));
+		RD::ComputeListID compute_list = RD::get_singleton()->compute_list_begin();
+
+		RID build_shader = luminance_histogram.shader.version_get_shader(luminance_histogram.shader_version, LUMINANCE_HISTOGRAM_BUILD);
+		RD::Uniform u_source_texture(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ default_sampler, p_source_texture }));
+		RD::Uniform u_histogram_build(RD::UNIFORM_TYPE_STORAGE_BUFFER, 0, p_luminance_buffers->histogram);
+		RD::get_singleton()->compute_list_bind_compute_pipeline(compute_list, luminance_histogram.pipelines[LUMINANCE_HISTOGRAM_BUILD]);
+		RD::get_singleton()->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(build_shader, 0, u_source_texture), 0);
+		RD::get_singleton()->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(build_shader, 1, u_histogram_build), 1);
+		RD::get_singleton()->compute_list_set_push_constant(compute_list, &push_constant, sizeof(LuminanceHistogramPushConstant));
+		RD::get_singleton()->compute_list_dispatch_threads(compute_list,
+				(p_source_size.x + push_constant.sample_stride - 1) / push_constant.sample_stride,
+				(p_source_size.y + push_constant.sample_stride - 1) / push_constant.sample_stride, 1);
+
+		RD::get_singleton()->compute_list_add_barrier(compute_list);
+		RID resolve_shader = luminance_histogram.shader.version_get_shader(luminance_histogram.shader_version, LUMINANCE_HISTOGRAM_RESOLVE);
+		RD::Uniform u_histogram_resolve(RD::UNIFORM_TYPE_STORAGE_BUFFER, 0, p_luminance_buffers->histogram);
+		RD::Uniform u_dest_luminance(RD::UNIFORM_TYPE_IMAGE, 0, p_luminance_buffers->reduce[p_luminance_buffers->reduce.size() - 1]);
+		RD::Uniform u_previous_luminance(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ default_sampler, p_luminance_buffers->current }));
+		RD::get_singleton()->compute_list_bind_compute_pipeline(compute_list, luminance_histogram.pipelines[LUMINANCE_HISTOGRAM_RESOLVE]);
+		RD::get_singleton()->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(resolve_shader, 0, u_histogram_resolve), 0);
+		RD::get_singleton()->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(resolve_shader, 1, u_dest_luminance), 1);
+		RD::get_singleton()->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(resolve_shader, 2, u_previous_luminance), 2);
+		RD::get_singleton()->compute_list_set_push_constant(compute_list, &push_constant, sizeof(LuminanceHistogramPushConstant));
+		RD::get_singleton()->compute_list_dispatch_threads(compute_list, 1, 1, 1);
+		RD::get_singleton()->compute_list_end();
+	} else if (prefer_raster_effects) {
 		LuminanceReduceRasterPushConstant push_constant;
 		memset(&push_constant, 0, sizeof(LuminanceReduceRasterPushConstant));
 

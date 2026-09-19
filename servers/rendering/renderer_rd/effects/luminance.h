@@ -31,6 +31,7 @@
 #pragma once
 
 #include "servers/rendering/renderer_rd/pipeline_cache_rd.h"
+#include "servers/rendering/renderer_rd/shaders/effects/luminance_histogram.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/luminance_reduce.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/luminance_reduce_raster.glsl.gen.h"
 #include "servers/rendering/renderer_rd/storage_rd/render_scene_buffers_rd.h"
@@ -86,6 +87,32 @@ private:
 		PipelineCacheRD pipelines[LUMINANCE_REDUCE_FRAGMENT_MAX];
 	} luminance_reduce_raster;
 
+	enum LuminanceHistogramMode {
+		LUMINANCE_HISTOGRAM_BUILD,
+		LUMINANCE_HISTOGRAM_RESOLVE,
+		LUMINANCE_HISTOGRAM_MAX
+	};
+
+	struct LuminanceHistogramPushConstant {
+		int32_t source_size[2];
+		int32_t sample_stride;
+		int32_t bin_count;
+		float min_ev;
+		float max_ev;
+		float low_percentile;
+		float high_percentile;
+		float center_weight;
+		float exposure_adjust;
+		float min_luminance;
+		float max_luminance;
+	};
+
+	struct LuminanceHistogram {
+		LuminanceHistogramShaderRD shader;
+		RID shader_version;
+		RID pipelines[LUMINANCE_HISTOGRAM_MAX];
+	} luminance_histogram;
+
 public:
 	class LuminanceBuffers : public RenderBufferCustomDataRD {
 		GDCLASS(LuminanceBuffers, RenderBufferCustomDataRD);
@@ -96,6 +123,7 @@ public:
 	public:
 		Vector<RID> reduce;
 		RID current;
+		RID histogram;
 
 		virtual void configure(RenderSceneBuffersRD *p_render_buffers) override;
 		virtual void free_data() override;
@@ -105,7 +133,7 @@ public:
 
 	Ref<LuminanceBuffers> get_luminance_buffers(Ref<RenderSceneBuffersRD> p_render_buffers);
 	RID get_current_luminance_buffer(Ref<RenderSceneBuffersRD> p_render_buffers);
-	void luminance_reduction(RID p_source_texture, const Size2i p_source_size, Ref<LuminanceBuffers> p_luminance_buffers, float p_min_luminance, float p_max_luminance, float p_adjust, bool p_set = false);
+	void luminance_reduction(RID p_source_texture, const Size2i p_source_size, Ref<LuminanceBuffers> p_luminance_buffers, float p_min_luminance, float p_max_luminance, float p_adjust, bool p_set = false, int p_metering_mode = 0, float p_low_percentile = 0.1f, float p_high_percentile = 0.9f, float p_min_ev = -12.0f, float p_max_ev = 16.0f, float p_center_weight = 0.65f);
 
 	Luminance(bool p_prefer_raster_effects);
 	~Luminance();

@@ -155,6 +155,31 @@ void RendererCameraAttributes::camera_attributes_set_auto_exposure(RID p_camera_
 	cam_attributes->auto_exposure_scale = p_scale;
 }
 
+void RendererCameraAttributes::camera_attributes_set_auto_exposure_metering(RID p_camera_attributes, int p_mode, float p_low_percentile, float p_high_percentile, float p_min_ev, float p_max_ev, float p_center_weight) {
+	CameraAttributes *cam_attributes = camera_attributes_owner.get_or_null(p_camera_attributes);
+	ERR_FAIL_NULL(cam_attributes);
+	const int mode = CLAMP(p_mode, 0, 1);
+	const float low_percentile = CLAMP(p_low_percentile, 0.0f, 1.0f);
+	const float high_percentile = CLAMP(p_high_percentile, low_percentile, 1.0f);
+	const float min_ev = MIN(p_min_ev, p_max_ev - 0.01f);
+	const float max_ev = MAX(p_max_ev, min_ev + 0.01f);
+	const float center_weight = CLAMP(p_center_weight, 0.0f, 1.0f);
+	if (cam_attributes->auto_exposure_metering_mode != mode ||
+			cam_attributes->auto_exposure_histogram_low_percentile != low_percentile ||
+			cam_attributes->auto_exposure_histogram_high_percentile != high_percentile ||
+			cam_attributes->auto_exposure_histogram_min_ev != min_ev ||
+			cam_attributes->auto_exposure_histogram_max_ev != max_ev ||
+			cam_attributes->auto_exposure_histogram_center_weight != center_weight) {
+		cam_attributes->auto_exposure_version = ++auto_exposure_counter;
+	}
+	cam_attributes->auto_exposure_metering_mode = mode;
+	cam_attributes->auto_exposure_histogram_low_percentile = low_percentile;
+	cam_attributes->auto_exposure_histogram_high_percentile = high_percentile;
+	cam_attributes->auto_exposure_histogram_min_ev = min_ev;
+	cam_attributes->auto_exposure_histogram_max_ev = max_ev;
+	cam_attributes->auto_exposure_histogram_center_weight = center_weight;
+}
+
 float RendererCameraAttributes::camera_attributes_get_auto_exposure_min_sensitivity(RID p_camera_attributes) {
 	CameraAttributes *cam_attributes = camera_attributes_owner.get_or_null(p_camera_attributes);
 	ERR_FAIL_NULL_V(cam_attributes, 0.0);
@@ -177,6 +202,42 @@ float RendererCameraAttributes::camera_attributes_get_auto_exposure_scale(RID p_
 	CameraAttributes *cam_attributes = camera_attributes_owner.get_or_null(p_camera_attributes);
 	ERR_FAIL_NULL_V(cam_attributes, 0.0);
 	return cam_attributes->auto_exposure_scale;
+}
+
+int RendererCameraAttributes::camera_attributes_get_auto_exposure_metering_mode(RID p_camera_attributes) {
+	CameraAttributes *cam_attributes = camera_attributes_owner.get_or_null(p_camera_attributes);
+	ERR_FAIL_NULL_V(cam_attributes, 0);
+	return cam_attributes->auto_exposure_metering_mode;
+}
+
+float RendererCameraAttributes::camera_attributes_get_auto_exposure_histogram_low_percentile(RID p_camera_attributes) {
+	CameraAttributes *cam_attributes = camera_attributes_owner.get_or_null(p_camera_attributes);
+	ERR_FAIL_NULL_V(cam_attributes, 0.1f);
+	return cam_attributes->auto_exposure_histogram_low_percentile;
+}
+
+float RendererCameraAttributes::camera_attributes_get_auto_exposure_histogram_high_percentile(RID p_camera_attributes) {
+	CameraAttributes *cam_attributes = camera_attributes_owner.get_or_null(p_camera_attributes);
+	ERR_FAIL_NULL_V(cam_attributes, 0.9f);
+	return cam_attributes->auto_exposure_histogram_high_percentile;
+}
+
+float RendererCameraAttributes::camera_attributes_get_auto_exposure_histogram_min_ev(RID p_camera_attributes) {
+	CameraAttributes *cam_attributes = camera_attributes_owner.get_or_null(p_camera_attributes);
+	ERR_FAIL_NULL_V(cam_attributes, -12.0f);
+	return cam_attributes->auto_exposure_histogram_min_ev;
+}
+
+float RendererCameraAttributes::camera_attributes_get_auto_exposure_histogram_max_ev(RID p_camera_attributes) {
+	CameraAttributes *cam_attributes = camera_attributes_owner.get_or_null(p_camera_attributes);
+	ERR_FAIL_NULL_V(cam_attributes, 16.0f);
+	return cam_attributes->auto_exposure_histogram_max_ev;
+}
+
+float RendererCameraAttributes::camera_attributes_get_auto_exposure_histogram_center_weight(RID p_camera_attributes) {
+	CameraAttributes *cam_attributes = camera_attributes_owner.get_or_null(p_camera_attributes);
+	ERR_FAIL_NULL_V(cam_attributes, 0.65f);
+	return cam_attributes->auto_exposure_histogram_center_weight;
 }
 
 uint64_t RendererCameraAttributes::camera_attributes_get_auto_exposure_version(RID p_camera_attributes) {

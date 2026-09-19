@@ -47,6 +47,12 @@ private:
 		float auto_exposure_max_sensitivity = 800.0;
 		float auto_exposure_adjust_speed = 1.0;
 		float auto_exposure_scale = 1.0;
+		int auto_exposure_metering_mode = 0;
+		float auto_exposure_histogram_low_percentile = 0.1;
+		float auto_exposure_histogram_high_percentile = 0.9;
+		float auto_exposure_histogram_min_ev = -12.0;
+		float auto_exposure_histogram_max_ev = 16.0;
+		float auto_exposure_histogram_center_weight = 0.65;
 		uint64_t auto_exposure_version = 0;
 
 		bool dof_blur_far_enabled = false;
@@ -100,10 +106,17 @@ public:
 	float camera_attributes_get_exposure_normalization_factor(RID p_camera_attributes);
 
 	void camera_attributes_set_auto_exposure(RID p_camera_attributes, bool p_enable, float p_min_sensitivity, float p_max_sensitivity, float p_speed, float p_scale);
+	void camera_attributes_set_auto_exposure_metering(RID p_camera_attributes, int p_mode, float p_low_percentile, float p_high_percentile, float p_min_ev, float p_max_ev, float p_center_weight);
 	float camera_attributes_get_auto_exposure_min_sensitivity(RID p_camera_attributes);
 	float camera_attributes_get_auto_exposure_max_sensitivity(RID p_camera_attributes);
 	float camera_attributes_get_auto_exposure_adjust_speed(RID p_camera_attributes);
 	float camera_attributes_get_auto_exposure_scale(RID p_camera_attributes);
+	int camera_attributes_get_auto_exposure_metering_mode(RID p_camera_attributes);
+	float camera_attributes_get_auto_exposure_histogram_low_percentile(RID p_camera_attributes);
+	float camera_attributes_get_auto_exposure_histogram_high_percentile(RID p_camera_attributes);
+	float camera_attributes_get_auto_exposure_histogram_min_ev(RID p_camera_attributes);
+	float camera_attributes_get_auto_exposure_histogram_max_ev(RID p_camera_attributes);
+	float camera_attributes_get_auto_exposure_histogram_center_weight(RID p_camera_attributes);
 	uint64_t camera_attributes_get_auto_exposure_version(RID p_camera_attributes);
 
 	_FORCE_INLINE_ bool camera_attributes_uses_auto_exposure(RID p_camera_attributes) {

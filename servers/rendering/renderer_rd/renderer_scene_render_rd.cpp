@@ -562,7 +562,14 @@ void RendererSceneRenderRD::_render_buffers_post_process_and_tonemap(const Rende
 		double step = RSG::camera_attributes->camera_attributes_get_auto_exposure_adjust_speed(p_render_data->camera_attributes) * time_step;
 		float auto_exposure_min_sensitivity = RSG::camera_attributes->camera_attributes_get_auto_exposure_min_sensitivity(p_render_data->camera_attributes);
 		float auto_exposure_max_sensitivity = RSG::camera_attributes->camera_attributes_get_auto_exposure_max_sensitivity(p_render_data->camera_attributes);
-		luminance->luminance_reduction(rb->get_internal_texture(), rb->get_internal_size(), luminance_buffers, auto_exposure_min_sensitivity, auto_exposure_max_sensitivity, step, set_immediate);
+		int auto_exposure_metering_mode = RSG::camera_attributes->camera_attributes_get_auto_exposure_metering_mode(p_render_data->camera_attributes);
+		float histogram_low_percentile = RSG::camera_attributes->camera_attributes_get_auto_exposure_histogram_low_percentile(p_render_data->camera_attributes);
+		float histogram_high_percentile = RSG::camera_attributes->camera_attributes_get_auto_exposure_histogram_high_percentile(p_render_data->camera_attributes);
+		float histogram_min_ev = RSG::camera_attributes->camera_attributes_get_auto_exposure_histogram_min_ev(p_render_data->camera_attributes);
+		float histogram_max_ev = RSG::camera_attributes->camera_attributes_get_auto_exposure_histogram_max_ev(p_render_data->camera_attributes);
+		float histogram_center_weight = RSG::camera_attributes->camera_attributes_get_auto_exposure_histogram_center_weight(p_render_data->camera_attributes);
+		luminance->luminance_reduction(rb->get_internal_texture(), rb->get_internal_size(), luminance_buffers, auto_exposure_min_sensitivity, auto_exposure_max_sensitivity, step, set_immediate,
+				auto_exposure_metering_mode, histogram_low_percentile, histogram_high_percentile, histogram_min_ev, histogram_max_ev, histogram_center_weight);
 
 		// Swap final reduce with prev luminance.
 
