@@ -3779,6 +3779,8 @@ void RenderingServer::init() {
 	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/anti_aliasing/screen_space_roughness_limiter/limit", PROPERTY_HINT_RANGE, "0.01,1.0,0.01"), 0.18);
 
 	GLOBAL_DEF_RST(PropertyInfo(Variant::FLOAT, "rendering/anti_aliasing/quality/smaa_edge_detection_threshold", PROPERTY_HINT_RANGE, "0.01,0.2,0.01"), 0.05);
+	GLOBAL_DEF_RST(PropertyInfo(Variant::FLOAT, "rendering/anti_aliasing/quality/taa_reactive_edge_scale", PROPERTY_HINT_RANGE, "0.0,2.0,0.01"), 1.0);
+	GLOBAL_DEF_RST(PropertyInfo(Variant::FLOAT, "rendering/anti_aliasing/quality/taa_reactive_edge_max_weight", PROPERTY_HINT_RANGE, "0.0625,1.0,0.01"), 0.34);
 
 	GLOBAL_DEF("rendering/anti_aliasing/quality/use_debanding", false);
 

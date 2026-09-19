@@ -29,6 +29,7 @@
 /**************************************************************************/
 
 #include "taa.h"
+#include "core/config/project_settings.h"
 #include "servers/rendering/renderer_rd/effects/copy_effects.h"
 #include "servers/rendering/renderer_rd/storage_rd/material_storage.h"
 #include "servers/rendering/renderer_rd/uniform_set_cache_rd.h"
@@ -69,6 +70,8 @@ void TAA::resolve(RID p_frame, RID p_temp, RID p_depth, RID p_velocity, RID p_pr
 	push_constant.resolution_height = p_resolution.height;
 	push_constant.disocclusion_threshold = 2.5f; // If velocity changes by less than this amount of texels we can retain the accumulation buffer.
 	push_constant.variance_dynamic = CLAMP(base_variance * variance_scale, base_variance_min, base_variance_max); // Variance dynamically scales based on resolution
+	push_constant.reactive_edge_scale = GLOBAL_GET("rendering/anti_aliasing/quality/taa_reactive_edge_scale");
+	push_constant.reactive_edge_max_weight = GLOBAL_GET("rendering/anti_aliasing/quality/taa_reactive_edge_max_weight");
 
 	RD::ComputeListID compute_list = RD::get_singleton()->compute_list_begin();
 	RD::get_singleton()->compute_list_bind_compute_pipeline(compute_list, pipeline);
