@@ -1289,6 +1289,7 @@ MaterialStorage::MaterialStorage() {
 		actions.renames["BENT_NORMAL_MAP"] = "bent_normal_map";
 		actions.renames["ALBEDO"] = "albedo";
 		actions.renames["ALPHA"] = "alpha";
+		actions.renames["TAA_REACTIVE"] = "taa_reactive";
 		actions.renames["PREMUL_ALPHA_FACTOR"] = "premul_alpha";
 		actions.renames["METALLIC"] = "metallic";
 		actions.renames["SPECULAR"] = "specular";

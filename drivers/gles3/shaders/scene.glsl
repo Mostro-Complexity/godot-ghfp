@@ -2038,6 +2038,7 @@ void main() {
 	float ao_light_affect = 0.0;
 
 	float alpha = 1.0;
+	float taa_reactive = 0.0; // Compatibility accepts the shared spatial builtin; Forward+ consumes it.
 
 #if defined(TANGENT_USED) || defined(NORMAL_MAP_USED) || defined(LIGHT_ANISOTROPY_USED)
 	vec3 binormal = binormal_interp;

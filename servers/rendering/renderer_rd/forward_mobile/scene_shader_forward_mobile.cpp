@@ -660,6 +660,7 @@ void SceneShaderForwardMobile::init(const String p_defines) {
 		actions.renames["ALPHA_HASH_SCALE"] = "alpha_hash_scale_highp";
 		actions.renames["ALPHA_ANTIALIASING_EDGE"] = "alpha_antialiasing_edge_highp";
 		actions.renames["ALPHA_TEXTURE_COORDINATE"] = "alpha_texture_coordinate";
+		actions.renames["TAA_REACTIVE"] = "taa_reactive";
 
 		//builtins
 

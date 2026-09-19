@@ -52,6 +52,8 @@
 #define RB_TEX_DEPTH_MSAA SNAME("depth_msaa")
 #define RB_TEX_VELOCITY SNAME("velocity")
 #define RB_TEX_VELOCITY_MSAA SNAME("velocity_msaa")
+#define RB_TEX_REACTIVE SNAME("taa_reactive")
+#define RB_TEX_REACTIVE_MSAA SNAME("taa_reactive_msaa")
 
 #define RB_TEX_BLUR_0 SNAME("blur_0")
 #define RB_TEX_BLUR_1 SNAME("blur_1")
@@ -256,14 +258,6 @@ public:
 	_FORCE_INLINE_ RID get_internal_texture(const uint32_t p_layer) {
 		return get_texture_slice(RB_SCOPE_BUFFERS, RB_TEX_COLOR, p_layer, 0);
 	}
-	_FORCE_INLINE_ RID get_internal_texture_reactive(const uint32_t p_layer) {
-		RD::TextureView alpha_only_view;
-		alpha_only_view.swizzle_r = RD::TEXTURE_SWIZZLE_A;
-		alpha_only_view.swizzle_g = RD::TEXTURE_SWIZZLE_A;
-		alpha_only_view.swizzle_b = RD::TEXTURE_SWIZZLE_A;
-		alpha_only_view.swizzle_a = RD::TEXTURE_SWIZZLE_A;
-		return get_texture_slice_view(RB_SCOPE_BUFFERS, RB_TEX_COLOR, p_layer, 0, 1, 1, alpha_only_view);
-	}
 	_FORCE_INLINE_ RID get_color_msaa() const {
 		return get_texture(RB_SCOPE_BUFFERS, RB_TEX_COLOR_MSAA);
 	}
@@ -315,6 +309,13 @@ public:
 	RID get_velocity_buffer(bool p_get_msaa, uint32_t p_layer);
 
 	RID get_velocity_depth_buffer();
+
+	// Per-pixel material reactivity used by temporal reconstruction. This is separate from
+	// scene color alpha so transparent viewports and compositing retain their normal semantics.
+	void ensure_reactive_mask();
+	bool has_reactive_mask(bool p_has_msaa);
+	RID get_reactive_mask(bool p_get_msaa);
+	RID get_reactive_mask(bool p_get_msaa, uint32_t p_layer);
 
 	// Samplers adjusted with the mipmap bias that is best fit for the configuration of these render buffers.
 

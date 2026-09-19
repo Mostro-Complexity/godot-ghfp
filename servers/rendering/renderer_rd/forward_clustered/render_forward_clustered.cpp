@@ -187,18 +187,21 @@ RID RenderForwardClustered::RenderBufferDataForwardClustered::get_color_pass_fb(
 	}
 
 	RID velocity_buffer;
+	RID reactive_mask;
 	if (p_color_pass_flags & COLOR_PASS_FLAG_MOTION_VECTORS) {
 		render_buffers->ensure_velocity();
+		render_buffers->ensure_reactive_mask();
 		velocity_buffer = render_buffers->get_velocity_buffer(use_msaa);
+		reactive_mask = render_buffers->get_reactive_mask(use_msaa);
 	}
 
 	RID depth = use_msaa ? render_buffers->get_texture(RB_SCOPE_BUFFERS, RB_TEX_DEPTH_MSAA) : render_buffers->get_depth_texture();
 
 	if (render_buffers->has_texture(RB_SCOPE_VRS, RB_TEXTURE)) {
 		RID vrs_texture = render_buffers->get_texture(RB_SCOPE_VRS, RB_TEXTURE);
-		return FramebufferCacheRD::get_singleton()->get_cache_multiview(v_count, color, specular, velocity_buffer, depth, vrs_texture);
+		return FramebufferCacheRD::get_singleton()->get_cache_multiview(v_count, color, specular, velocity_buffer, reactive_mask, depth, vrs_texture);
 	} else {
-		return FramebufferCacheRD::get_singleton()->get_cache_multiview(v_count, color, specular, velocity_buffer, depth);
+		return FramebufferCacheRD::get_singleton()->get_cache_multiview(v_count, color, specular, velocity_buffer, reactive_mask, depth);
 	}
 }
 
@@ -242,12 +245,13 @@ RID RenderForwardClustered::RenderBufferDataForwardClustered::get_specular_only_
 	return FramebufferCacheRD::get_singleton()->get_cache_multiview(render_buffers->get_view_count(), specular);
 }
 
-RID RenderForwardClustered::RenderBufferDataForwardClustered::get_velocity_only_fb() {
+RID RenderForwardClustered::RenderBufferDataForwardClustered::get_motion_only_fb() {
 	bool use_msaa = render_buffers->get_msaa_3d() != RS::VIEWPORT_MSAA_DISABLED;
 
 	RID velocity = render_buffers->get_texture(RB_SCOPE_BUFFERS, use_msaa ? RB_TEX_VELOCITY_MSAA : RB_TEX_VELOCITY);
+	RID reactive = render_buffers->get_texture(RB_SCOPE_BUFFERS, use_msaa ? RB_TEX_REACTIVE_MSAA : RB_TEX_REACTIVE);
 
-	return FramebufferCacheRD::get_singleton()->get_cache_multiview(render_buffers->get_view_count(), velocity);
+	return FramebufferCacheRD::get_singleton()->get_cache_multiview(render_buffers->get_view_count(), velocity, reactive);
 }
 
 RD::DataFormat RenderForwardClustered::RenderBufferDataForwardClustered::get_specular_format() {
@@ -2198,7 +2202,8 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 			} else {
 				Vector<Color> motion_vector_clear_colors;
 				motion_vector_clear_colors.push_back(Color(-1, -1, 0, 0));
-				RD::get_singleton()->draw_list_begin(rb_data->get_velocity_only_fb(), RD::DRAW_CLEAR_ALL, motion_vector_clear_colors);
+				motion_vector_clear_colors.push_back(Color(0, 0, 0, 0));
+				RD::get_singleton()->draw_list_begin(rb_data->get_motion_only_fb(), RD::DRAW_CLEAR_ALL, motion_vector_clear_colors);
 				RD::get_singleton()->draw_list_end();
 			}
 		}
@@ -2398,12 +2403,16 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 
 	if (rb_data.is_valid() && use_msaa) {
 		bool resolve_velocity_buffer = (using_taa || using_upscaling || ce_needs_motion_vectors) && rb->has_velocity_buffer(true);
+		bool resolve_reactive_mask = (using_taa || using_upscaling) && rb->has_reactive_mask(true);
 		for (uint32_t v = 0; v < rb->get_view_count(); v++) {
 			RD::get_singleton()->texture_resolve_multisample(rb->get_color_msaa(v), rb->get_internal_texture(v));
 			resolve_effects->resolve_depth(rb->get_depth_msaa(v), rb->get_depth_texture(v), rb->get_internal_size(), texture_multisamples[msaa]);
 
 			if (resolve_velocity_buffer) {
 				RD::get_singleton()->texture_resolve_multisample(rb->get_velocity_buffer(true, v), rb->get_velocity_buffer(false, v));
+			}
+			if (resolve_reactive_mask) {
+				RD::get_singleton()->texture_resolve_multisample(rb->get_reactive_mask(true, v), rb->get_reactive_mask(false, v));
 			}
 		}
 	}
@@ -2446,7 +2455,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 				params.color = rb->get_internal_texture(v);
 				params.depth = rb->get_depth_texture(v);
 				params.velocity = rb->get_velocity_buffer(false, v);
-				params.reactive = rb->get_internal_texture_reactive(v);
+				params.reactive = rb->get_reactive_mask(false, v);
 				params.exposure = exposure;
 				params.output = rb->get_upscaled_texture(v);
 				params.z_near = p_render_data->scene_data->z_near;
@@ -4095,6 +4104,9 @@ void RenderForwardClustered::_geometry_instance_add_surface_with_material(Geomet
 	if (p_material->shader_data->is_animated()) {
 		flags |= GeometryInstanceSurfaceDataCache::FLAG_USES_MOTION_VECTOR;
 	}
+	if (p_material->shader_data->uses_taa_reactive) {
+		flags |= GeometryInstanceSurfaceDataCache::FLAG_USES_MOTION_VECTOR;
+	}
 
 	if (p_material->shader_data->stencil_enabled) {
 		if (p_material->shader_data->stencil_flags & SceneShaderForwardClustered::ShaderData::STENCIL_FLAG_READ) {
@@ -4428,6 +4440,14 @@ static RD::FramebufferFormatID _get_color_framebuffer_format_for_pipeline(RD::Da
 	if (p_velocity) {
 		attachment.format = RenderSceneBuffersRD::get_velocity_format();
 		attachment.usage_flags = RenderSceneBuffersRD::get_velocity_usage_bits(false, multisampling, p_can_be_storage);
+		attachments.push_back(attachment);
+	} else {
+		attachments.push_back(unused_attachment);
+	}
+
+	if (p_velocity) {
+		attachment.format = RD::DATA_FORMAT_R8_UNORM;
+		attachment.usage_flags = RenderSceneBuffersRD::get_color_usage_bits(false, multisampling, p_can_be_storage);
 		attachments.push_back(attachment);
 	} else {
 		attachments.push_back(unused_attachment);

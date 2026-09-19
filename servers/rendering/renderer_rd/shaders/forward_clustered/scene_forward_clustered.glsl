@@ -1069,6 +1069,7 @@ layout(location = 0) out vec4 frag_color;
 
 #ifdef MOTION_VECTORS
 layout(location = 2) out vec2 motion_vector;
+layout(location = 3) out float reactive_mask;
 #endif
 
 #include "../scene_forward_aa_inc.glsl"
@@ -1249,6 +1250,7 @@ void fragment_shader(in SceneData scene_data) {
 	float ao_light_affect = 0.0;
 
 	float alpha_highp = float(instances.data[instance_index].flags >> INSTANCE_FLAGS_FADE_SHIFT) / float(255.0);
+	float taa_reactive = 0.0;
 
 #ifdef TANGENT_USED
 	vec3 binormal = binormal_interp;
@@ -2995,6 +2997,7 @@ void fragment_shader(in SceneData scene_data) {
 	vec2 prev_position_uv = prev_position_clip * vec2(0.5, 0.5);
 
 	motion_vector = prev_position_uv - position_uv;
+	reactive_mask = clamp(taa_reactive, 0.0, 1.0);
 #endif
 }
 

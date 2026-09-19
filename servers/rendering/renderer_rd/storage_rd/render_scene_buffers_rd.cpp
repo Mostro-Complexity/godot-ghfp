@@ -714,6 +714,29 @@ RID RenderSceneBuffersRD::get_velocity_depth_buffer() {
 	return velocity_depth;
 }
 
+void RenderSceneBuffersRD::ensure_reactive_mask() {
+	if (!has_texture(RB_SCOPE_BUFFERS, RB_TEX_REACTIVE)) {
+		const bool msaa = msaa_3d != RS::VIEWPORT_MSAA_DISABLED;
+		create_texture(RB_SCOPE_BUFFERS, RB_TEX_REACTIVE, RD::DATA_FORMAT_R8_UNORM, get_color_usage_bits(msaa, false, can_be_storage));
+
+		if (msaa) {
+			create_texture(RB_SCOPE_BUFFERS, RB_TEX_REACTIVE_MSAA, RD::DATA_FORMAT_R8_UNORM, get_color_usage_bits(false, msaa, can_be_storage), texture_samples);
+		}
+	}
+}
+
+bool RenderSceneBuffersRD::has_reactive_mask(bool p_has_msaa) {
+	return has_texture(RB_SCOPE_BUFFERS, p_has_msaa ? RB_TEX_REACTIVE_MSAA : RB_TEX_REACTIVE);
+}
+
+RID RenderSceneBuffersRD::get_reactive_mask(bool p_get_msaa) {
+	return get_texture(RB_SCOPE_BUFFERS, p_get_msaa ? RB_TEX_REACTIVE_MSAA : RB_TEX_REACTIVE);
+}
+
+RID RenderSceneBuffersRD::get_reactive_mask(bool p_get_msaa, uint32_t p_layer) {
+	return get_texture_slice(RB_SCOPE_BUFFERS, p_get_msaa ? RB_TEX_REACTIVE_MSAA : RB_TEX_REACTIVE, p_layer, 0);
+}
+
 uint32_t RenderSceneBuffersRD::get_color_usage_bits(bool p_resolve, bool p_msaa, bool p_storage) {
 	DEV_ASSERT((!p_resolve && !p_msaa) || (p_resolve != p_msaa));
 
