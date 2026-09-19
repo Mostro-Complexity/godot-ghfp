@@ -1221,6 +1221,17 @@ const RendererSceneRender::CameraData *RendererViewport::viewport_get_prev_camer
 	return &viewport->prev_camera_data;
 }
 
+void RendererViewport::viewport_reset_temporal_history(RID p_viewport) {
+	Viewport *viewport = viewport_owner.get_or_null(p_viewport);
+	ERR_FAIL_NULL(viewport);
+
+	// Temporal resources are owned by the viewport's render buffers (TAA, FSR2,
+	// screen-space effects and volumetric reprojection). Releasing the aggregate
+	// invalidates them together; the normal draw path recreates and configures it.
+	viewport->render_buffers.unref();
+	viewport->prev_camera_data_frame = 0;
+}
+
 void RendererViewport::viewport_set_disable_2d(RID p_viewport, bool p_disable) {
 	Viewport *viewport = viewport_owner.get_or_null(p_viewport);
 	ERR_FAIL_NULL(viewport);
