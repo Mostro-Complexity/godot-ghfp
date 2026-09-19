@@ -49,6 +49,7 @@ layout(rg16f, set = 0, binding = 2) uniform restrict readonly image2D velocity_b
 layout(rg16f, set = 0, binding = 3) uniform restrict readonly image2D last_velocity_buffer;
 layout(set = 0, binding = 4) uniform sampler2D history_buffer;
 layout(rgba16f, set = 0, binding = 5) uniform restrict writeonly image2D output_buffer;
+layout(r8, set = 0, binding = 6) uniform restrict readonly image2D reactive_mask;
 
 layout(push_constant, std430) uniform Params {
 	vec2 resolution;
@@ -374,11 +375,13 @@ vec3 temporal_antialiasing(uvec2 pos_group_top_left, uvec2 pos_group, uvec2 pos_
 		// Increase blend factor when there is disocclusion (fixes a lot of the remaining ghosting).
 		float factor_disocclusion = get_factor_disocclusion(uv_reprojected, velocity);
 		float factor_reactive_edge = get_factor_reactive_edge(pos_group, pos_screen, velocity);
+		float factor_reactive_material = imageLoad(reactive_mask, ivec2(pos_screen)).r;
+		float factor_reactive = max(factor_reactive_edge, factor_reactive_material);
 
 		// Add to the blend factor
 		blend_factor = clamp(blend_factor + factor_screen + factor_disocclusion, 0.0, 1.0);
 		blend_factor = max(blend_factor, mix(RPC_16,
-			params.reactive_edge_max_weight, factor_reactive_edge));
+			params.reactive_edge_max_weight, factor_reactive));
 	}
 
 	// Resolve

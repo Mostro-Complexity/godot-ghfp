@@ -1167,6 +1167,7 @@ void main() {
 	float ao_light_affect_highp = 0.0;
 
 	float alpha_highp = 1.0;
+	float taa_reactive = 0.0; // Forward Mobile accepts the shared builtin but has no temporal mask.
 
 #if defined(TANGENT_USED) || defined(NORMAL_MAP_USED) || defined(LIGHT_ANISOTROPY_USED) || defined(BENT_NORMAL_MAP_USED)
 	vec3 binormal_highp = binormal_interp;
