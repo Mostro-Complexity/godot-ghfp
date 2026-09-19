@@ -555,6 +555,7 @@ public:
 
 	virtual void viewport_set_update_mode(RID p_viewport, RSE::ViewportUpdateMode p_mode) = 0;
 	virtual RSE::ViewportUpdateMode viewport_get_update_mode(RID p_viewport) const = 0;
+	virtual void viewport_reset_temporal_history(RID p_viewport) = 0;
 
 	virtual void viewport_set_clear_mode(RID p_viewport, RSE::ViewportClearMode p_clear_mode) = 0;
 
