@@ -174,6 +174,10 @@ void SceneShaderForwardClustered::ShaderData::set_code(const String &p_code) {
 	}
 
 	if (err != OK) {
+		// Pipelines own references to the current shader variants. Release them before the
+		// version; otherwise the device invalidates their RIDs with the shader and the next
+		// successful edit tries to release the same pipelines again.
+		pipeline_hash_map.clear_pipelines();
 		if (version.is_valid()) {
 			SceneShaderForwardClustered::singleton->shader.version_free(version);
 			version = RID();
