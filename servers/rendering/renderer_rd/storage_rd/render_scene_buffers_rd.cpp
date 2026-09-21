@@ -794,7 +794,7 @@ RID RenderSceneBuffersRD::get_velocity_depth_buffer() {
 
 void RenderSceneBuffersRD::ensure_reactive_mask() {
 	if (!has_texture(RB_SCOPE_BUFFERS, RB_TEX_REACTIVE)) {
-		const bool msaa = msaa_3d != RS::VIEWPORT_MSAA_DISABLED;
+		const bool msaa = msaa_3d != RSE::VIEWPORT_MSAA_DISABLED;
 		create_texture(RB_SCOPE_BUFFERS, RB_TEX_REACTIVE, RD::DATA_FORMAT_R8_UNORM, get_color_usage_bits(msaa, false, can_be_storage));
 
 		if (msaa) {
