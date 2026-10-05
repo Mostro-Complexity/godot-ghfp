@@ -46,4 +46,8 @@ public:
 
 	virtual RID get_environment() const = 0;
 	virtual RID get_camera_attributes() const = 0;
+	// Returns the camera's manual exposure normalization factor used by the renderer.
+	// This does not include the separate auto-exposure result applied during tonemapping.
+	// Returns -1.0 when the renderer does not expose this value.
+	virtual float get_camera_exposure_normalization_factor() const;
 };

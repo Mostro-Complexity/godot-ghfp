@@ -31,6 +31,7 @@
 #pragma once
 
 #include "core/templates/paged_allocator.h"
+#include "core/os/mutex.h"
 #include "servers/rendering/multi_uma_buffer.h"
 #include "servers/rendering/renderer_rd/cluster_builder_rd.h"
 #include "servers/rendering/renderer_rd/effects/fsr2.h"
@@ -292,6 +293,18 @@ private:
 	};
 
 	struct SceneState {
+		// Per-implementation-UBO fail-closed result shared by preflight and the
+		// corresponding render-pass UniformSet construction.
+		struct CloudMediumV2BindingSnapshot {
+			bool descriptor_validated = false;
+			bool binding_enabled = false;
+			RID lt_texture;
+			RID depth_texture;
+			RID ray_map;
+			RID exception_lt_pool;
+			RID exception_depth_pool;
+		};
+
 		// This struct is loaded into Set 1 - Binding 1, populated at start of rendering a frame, must match with shader code
 		struct UBO {
 			uint32_t cluster_shift;
@@ -316,6 +329,11 @@ private:
 			float volumetric_fog_inv_length;
 			float volumetric_fog_detail_spread;
 			uint32_t volumetric_fog_pad;
+			float directional_contact_shadow[4]; // xyz world direction, w enabled
+			uint32_t cloud_medium_v2[4]; // enabled, trace width, trace height, compact slot capacity
+			uint32_t cloud_medium_v2_pool[4]; // candidate layers, pool capacity, eye count, format version
+			uint32_t cloud_medium_v2_status[4]; // readback complete, fatal flags, validated_ready, classified rays
+			uint32_t cloud_medium_v2_validation[4]; // filled columns, pool requests, DIRECT count, expected rays
 		};
 
 		struct PushConstantUbershader {
@@ -394,6 +412,7 @@ private:
 		static_assert(std::is_trivially_constructible_v<InstanceData>);
 
 		UBO ubo;
+		LocalVector<CloudMediumV2BindingSnapshot> cloud_medium_v2_binding_snapshots;
 
 		LocalVector<RID> uniform_buffers;
 		LocalVector<RID> implementation_uniform_buffers;
@@ -446,6 +465,17 @@ private:
 	} scene_state;
 
 	static RenderForwardClustered *singleton;
+	struct HDRCaptureRequest {
+		uint64_t id = 0;
+		RID viewport;
+		RID render_target;
+		RID camera;
+		Callable completion;
+		uint64_t deadline_msec = 0;
+	};
+	Mutex hdr_capture_mutex;
+	HDRCaptureRequest hdr_capture_request;
+	bool hdr_capture_pending = false;
 
 	uint32_t _setup_environment(const RenderDataRD *p_render_data, bool p_no_fog, const Size2i &p_screen_size, const Size2 &p_viewport_size, const Color &p_default_bg_color, bool p_opaque_render_buffers = false, bool p_apply_alpha_multiplier = false, bool p_pancake_shadows = false);
 	void _setup_voxelgis(const PagedArray<RID> &p_voxelgis);
@@ -762,7 +792,7 @@ private:
 	/* Volumetric fog */
 	RID shadow_sampler;
 
-	void _update_volumetric_fog(Ref<RenderSceneBuffersRD> p_render_buffers, RID p_environment, const Projection &p_cam_projection, const Transform3D &p_cam_transform, const Transform3D &p_prev_cam_inv_transform, RID p_shadow_atlas, int p_directional_light_count, bool p_use_directional_shadows, int p_positional_light_count, int p_voxel_gi_count, const PagedArray<RID> &p_fog_volumes);
+	void _update_volumetric_fog(Ref<RenderSceneBuffersRD> p_render_buffers, RID p_environment, const Projection &p_cam_projection, const Transform3D &p_cam_transform, const Transform3D &p_prev_cam_inv_transform, RID p_shadow_atlas, int p_directional_light_count, bool p_use_directional_shadows, int p_positional_light_count, int p_voxel_gi_count, const PagedArray<RID> &p_fog_volumes, RID p_camera_attributes);
 
 	/* Render shadows */
 
@@ -782,6 +812,7 @@ private:
 
 	/* Debug */
 	void _debug_draw_cluster(Ref<RenderSceneBuffersRD> p_render_buffers);
+	void _process_hdr_capture(const Ref<RenderSceneBuffersRD> &p_render_buffers);
 
 protected:
 	/* setup */
@@ -809,6 +840,8 @@ protected:
 
 public:
 	static RenderForwardClustered *get_singleton() { return singleton; }
+	bool request_hdr_capture(uint64_t p_id, RID p_viewport, RID p_render_target, RID p_camera, uint64_t p_deadline_msec, const Callable &p_completion);
+	void cancel_hdr_capture(uint64_t p_id);
 
 	ClusterBuilderSharedDataRD *get_cluster_builder_shared() { return &cluster_builder_shared; }
 	RendererRD::SSEffects *get_ss_effects() { return ss_effects; }

@@ -19,6 +19,7 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 #include "../oct_inc.glsl"
 
 #include "../area_lights_inc.glsl"
+#include "fog_source_units_inc.glsl"
 
 #define M_TAU 6.28318530718
 #define M_PI 3.14159265359
@@ -57,6 +58,10 @@ layout(set = 0, binding = 8) uniform sampler linear_sampler;
 
 #ifdef MODE_DENSITY
 layout(rgba16f, set = 0, binding = 9) uniform restrict writeonly image3D density_map;
+layout(rgba32f, set = 0, binding = 22) uniform restrict writeonly image3D local_medium_coefficients;
+layout(rgba32f, set = 0, binding = 23) uniform restrict writeonly image3D local_medium_emission;
+layout(rgba32f, set = 0, binding = 24) uniform restrict writeonly image3D local_medium_source;
+layout(rgba32f, set = 0, binding = 25) uniform restrict writeonly image3D local_medium_direct_source;
 #endif
 
 #ifdef MODE_FOG
@@ -186,7 +191,8 @@ layout(set = 0, binding = 15, std140) uniform Params {
 	float temporal_blend;
 
 	vec2 sky_border_size;
-	vec2 pad;
+	uint capture_local_medium;
+	float direct_camera_normalization;
 
 	mat3x4 cam_rotation;
 	mat4 to_prev_view;
@@ -365,6 +371,7 @@ void main() {
 	uint cluster_z = uint(clamp((abs(view_pos.z) / params.z_far) * 32.0, 0.0, 31.0));
 
 	vec3 total_light = vec3(0.0);
+	vec3 known_direct_light = vec3(0.0);
 
 	float total_density = params.base_density;
 #ifdef NO_IMAGE_ATOMICS
@@ -437,7 +444,9 @@ void main() {
 					shadow_attenuation = mix(vec3(1.0 - directional_lights.data[i].shadow_opacity), vec3(1.0), shadow);
 				}
 
-				total_light += shadow_attenuation * directional_lights.data[i].color * directional_lights.data[i].energy * henyey_greenstein(dot(safe_normalize(view_pos), safe_normalize(directional_lights.data[i].direction)), params.phase_g) * directional_lights.data[i].volumetric_fog_energy;
+				vec3 direct_contribution = shadow_attenuation * directional_lights.data[i].color * directional_lights.data[i].energy * henyey_greenstein(dot(safe_normalize(view_pos), safe_normalize(directional_lights.data[i].direction)), params.phase_g) * directional_lights.data[i].volumetric_fog_energy;
+				total_light += direct_contribution;
+				if (params.capture_local_medium != 0u) { known_direct_light += direct_contribution; }
 			}
 		}
 
@@ -523,7 +532,9 @@ void main() {
 
 							shadow_attenuation = mix(1.0 - omni_lights.data[light_index].shadow_opacity, 1.0, exp(min(0.0, (pos.z - depth)) / omni_lights.data[light_index].inv_radius * INV_FOG_FADE));
 						}
-						total_light += light * attenuation * shadow_attenuation * henyey_greenstein(dot(safe_normalize(light_pos - view_pos), safe_normalize(view_pos)), params.phase_g) * omni_lights.data[light_index].volumetric_fog_energy;
+						vec3 direct_contribution = light * attenuation * shadow_attenuation * henyey_greenstein(dot(safe_normalize(light_pos - view_pos), safe_normalize(view_pos)), params.phase_g) * omni_lights.data[light_index].volumetric_fog_energy;
+						total_light += direct_contribution;
+						if (params.capture_local_medium != 0u) { known_direct_light += direct_contribution; }
 					}
 				}
 			}
@@ -588,7 +599,9 @@ void main() {
 
 							shadow_attenuation = mix(1.0 - spot_lights.data[light_index].shadow_opacity, 1.0, exp(min(0.0, (pos.z - depth)) / spot_lights.data[light_index].inv_radius * INV_FOG_FADE));
 						}
-						total_light += light * attenuation * shadow_attenuation * henyey_greenstein(dot(safe_normalize(light_rel_vec), safe_normalize(view_pos)), params.phase_g) * spot_lights.data[light_index].volumetric_fog_energy;
+						vec3 direct_contribution = light * attenuation * shadow_attenuation * henyey_greenstein(dot(safe_normalize(light_rel_vec), safe_normalize(view_pos)), params.phase_g) * spot_lights.data[light_index].volumetric_fog_energy;
+						total_light += direct_contribution;
+						if (params.capture_local_medium != 0u) { known_direct_light += direct_contribution; }
 					}
 				}
 			}
@@ -693,7 +706,9 @@ void main() {
 							if (dot(light_rel_vec, light_rel_vec) > EPSILON) {
 								cos_theta = dot(normalize(light_rel_vec), normalize(view_pos));
 							}
-							total_light += light_color * attenuation * shadow_attenuation * henyey_greenstein(cos_theta, params.phase_g) * area_lights.data[light_index].volumetric_fog_energy;
+							vec3 direct_contribution = light_color * attenuation * shadow_attenuation * henyey_greenstein(cos_theta, params.phase_g) * area_lights.data[light_index].volumetric_fog_energy;
+							total_light += direct_contribution;
+							if (params.capture_local_medium != 0u) { known_direct_light += direct_contribution; }
 						}
 					}
 				}
@@ -803,6 +818,20 @@ void main() {
 	vec4 final_density = vec4(total_light * scattering + emission, total_density);
 	bool is_reprojected_density_invalid = any(isnan(reprojected_density)) || any(isinf(reprojected_density));
 	bool is_final_density_invalid = any(isnan(final_density)) || any(isinf(final_density));
+	if (params.capture_local_medium != 0u) {
+		// Canonical froxel centre, before history, FP16 clamp and filtering.
+		// RGB=sigma_s, alpha=sigma_t. Emission/source alpha is validity.
+		// The complete source is explicitly uncertified, not physical radiance:
+		// its light, sky, GI and emission terms have different normalization.
+		bool coefficients_valid = !isnan(total_density) && !isinf(total_density) && !any(isnan(scattering)) && !any(isinf(scattering));
+		bool emission_valid = !any(isnan(emission)) && !any(isinf(emission));
+		bool source_valid = !any(isnan(final_density.rgb)) && !any(isinf(final_density.rgb));
+		imageStore(local_medium_coefficients, pos, coefficients_valid ? vec4(scattering, total_density) : vec4(0.0, 0.0, 0.0, -1.0));
+		imageStore(local_medium_emission, pos, emission_valid ? vec4(emission, 1.0) : vec4(0.0));
+		imageStore(local_medium_source, pos, source_valid ? vec4(final_density.rgb, 1.0) : vec4(0.0));
+		imageStore(local_medium_direct_source, pos, fog_direct_source_pre_camera(
+				known_direct_light, scattering, params.direct_camera_normalization));
+	}
 
 	if (is_final_density_invalid) {
 		final_density = is_reprojected_density_invalid ? vec4(0.0) : reprojected_density;

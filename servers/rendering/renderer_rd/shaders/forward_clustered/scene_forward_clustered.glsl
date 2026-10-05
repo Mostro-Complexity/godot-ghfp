@@ -1087,9 +1087,256 @@ layout(location = 3) out float reactive_mask;
 
 #endif //!defined(MODE_RENDER_DEPTH) && !defined(MODE_UNSHADED)
 
+// Emission/refraction handling can be compiled for depth variants too, so this
+// predicate must exist outside the colour-only helper block below.
+bool has_native_medium() {
+	return implementation_data.volumetric_fog_pad != 0u || implementation_data.cloud_medium_v2.x != 0u;
+}
+
 #ifndef MODE_RENDER_DEPTH
 
+vec4 cloud_medium_v2_failure() {
+	// Opaque magenta is an intentional fail-visible result for DIRECT, malformed
+	// tags, invalid dimensions and corrupt node data. It is never neutral success.
+	return vec4(1.0, 0.0, 1.0, 0.0);
+}
+
+bool cloud_medium_v2_read_node(ivec2 pixel, uint eye, uint source, uint ticket, uint node_index, out float depth, out vec4 medium) {
+	if (source == 0u) {
+		if (node_index >= implementation_data.cloud_medium_v2.w) { return false; }
+		ivec3 lt_size = textureSize(sampler3D(volumetric_fog_texture, SAMPLER_LINEAR_CLAMP), 0);
+		ivec3 depth_size = textureSize(sampler3D(cloud_medium_depth_texture, SAMPLER_LINEAR_CLAMP), 0);
+		uint layer = eye * implementation_data.cloud_medium_v2.w + node_index;
+		if (pixel.x < 0 || pixel.y < 0 || pixel.x >= lt_size.x || pixel.y >= lt_size.y ||
+				pixel.x >= depth_size.x || pixel.y >= depth_size.y || layer >= uint(lt_size.z) || layer >= uint(depth_size.z)) {
+			return false;
+		}
+		medium = texelFetch(sampler3D(volumetric_fog_texture, SAMPLER_LINEAR_CLAMP), ivec3(pixel, int(layer)), 0);
+		depth = texelFetch(sampler3D(cloud_medium_depth_texture, SAMPLER_LINEAR_CLAMP), ivec3(pixel, int(layer)), 0).r;
+	} else if (source == 1u) {
+		uint candidate_layers = implementation_data.cloud_medium_v2_pool.x;
+		uint pool_capacity = implementation_data.cloud_medium_v2_pool.y;
+		if (node_index >= candidate_layers || ticket >= pool_capacity) { return false; }
+		uint pool_node = ticket * 96u + node_index;
+		// The native descriptor validates both physical SSBO byte sizes before
+		// enabling v2. Godot's shader reflection cannot parse OpArrayLength here.
+		if (pool_node >= pool_capacity * 96u) { return false; }
+		uvec2 packed_lt = cloud_medium_v2_exception_lt.data[pool_node];
+		vec2 rg = unpackHalf2x16(packed_lt.x);
+		vec2 ba = unpackHalf2x16(packed_lt.y);
+		medium = vec4(rg, ba);
+		depth = cloud_medium_v2_exception_depth.data[pool_node];
+	} else {
+		return false;
+	}
+	return !any(isnan(medium)) && !any(isinf(medium)) && !isnan(depth) && !isinf(depth) &&
+		depth >= 0.0 && medium.a >= 0.0 && medium.a <= 1.0 && all(greaterThanEqual(medium.rgb, vec3(0.0)));
+}
+
+vec4 cloud_medium_v2_column(ivec2 pixel, float z) {
+	uint eye = uint(ViewIndex);
+	uvec4 metadata = implementation_data.cloud_medium_v2;
+	uvec4 pool_metadata = implementation_data.cloud_medium_v2_pool;
+	uvec4 status = implementation_data.cloud_medium_v2_status;
+	uvec4 validation = implementation_data.cloud_medium_v2_validation;
+	uint expected_rays = metadata.y * metadata.z * pool_metadata.z;
+    if (metadata.x != 1u || status.x != 1u || status.y != 0u || status.z != 2u ||
+			status.w != expected_rays || validation.x != min(validation.y, pool_metadata.y) ||
+			validation.y > expected_rays || validation.z != 0u || validation.w != expected_rays) {
+		return cloud_medium_v2_failure();
+	}
+	if (pool_metadata.w != 2u || metadata.y == 0u || metadata.z == 0u || metadata.w != 24u ||
+			pool_metadata.x != 96u || pool_metadata.y == 0u || pool_metadata.z == 0u || eye >= pool_metadata.z) {
+		return cloud_medium_v2_failure();
+	}
+	if (z <= 0.0) { return vec4(0.0, 0.0, 0.0, 1.0); }
+	if (pixel.x < 0 || pixel.y < 0 || pixel.x >= int(metadata.y) || pixel.y >= int(metadata.z)) { return cloud_medium_v2_failure(); }
+	uint map_index = eye * metadata.y * metadata.z + uint(pixel.y) * metadata.y + uint(pixel.x);
+	// The native descriptor validates ray_map bytes for the whole view set.
+	if (map_index >= expected_rays) { return cloud_medium_v2_failure(); }
+	uint entry = cloud_medium_v2_ray_map.data[map_index];
+	uint tag = entry >> 30u;
+	uint payload = entry & 0x3fffffffu;
+	if (tag == 3u) {
+		return payload == 0u ? vec4(0.0, 0.0, 0.0, 1.0) : cloud_medium_v2_failure();
+	}
+	if (tag == 2u) { return cloud_medium_v2_failure(); } // DIRECT is not implemented.
+	uint source = tag;
+	uint ticket = source == 1u ? payload : 0u;
+	uint node_count = source == 0u ? payload : 96u;
+	if ((source == 0u && (node_count < 2u || node_count > metadata.w)) ||
+			(source == 1u && (payload >= pool_metadata.y || pool_metadata.y == 0u || node_count < 2u || node_count > 128u))) {
+		return cloud_medium_v2_failure();
+	}
+	float previous_depth = 0.0;
+	for (uint i = 0u; i < node_count; i++) {
+		float node_depth;
+		vec4 node_medium;
+		if (!cloud_medium_v2_read_node(pixel, eye, source, ticket, i, node_depth, node_medium) ||
+				(i > 0u && node_depth < previous_depth)) {
+			return cloud_medium_v2_failure();
+		}
+		previous_depth = node_depth;
+	}
+	float first_depth;
+	vec4 first_medium;
+	if (!cloud_medium_v2_read_node(pixel, eye, source, ticket, 0u, first_depth, first_medium)) { return cloud_medium_v2_failure(); }
+	if (z <= first_depth) { return vec4(0.0, 0.0, 0.0, 1.0); }
+	float last_depth;
+	vec4 last_medium;
+	if (!cloud_medium_v2_read_node(pixel, eye, source, ticket, node_count - 1u, last_depth, last_medium)) { return cloud_medium_v2_failure(); }
+	if (z >= last_depth) { return last_medium; }
+	uint lo = 0u;
+	uint hi = node_count - 1u;
+	for (uint search = 0u; search < 8u && hi - lo > 1u; search++) {
+		uint mid = (lo + hi) / 2u;
+		float middle_depth;
+		vec4 middle_medium;
+		if (!cloud_medium_v2_read_node(pixel, eye, source, ticket, mid, middle_depth, middle_medium)) { return cloud_medium_v2_failure(); }
+		if (middle_depth <= z) { lo = mid; } else { hi = mid; }
+	}
+	float near_depth;
+	float far_depth;
+	vec4 a;
+	vec4 b;
+	if (!cloud_medium_v2_read_node(pixel, eye, source, ticket, lo, near_depth, a) ||
+			!cloud_medium_v2_read_node(pixel, eye, source, ticket, hi, far_depth, b)) { return cloud_medium_v2_failure(); }
+	if (far_depth < near_depth) { return cloud_medium_v2_failure(); }
+	// Coincident producer boundaries are valid. Binary search normally chooses
+	// the last node at that depth; if a duplicate pair remains, select its far node.
+	if (far_depth == near_depth) { return b; }
+	float fraction = clamp((z - near_depth) / max(far_depth - near_depth, 1e-6), 0.0, 1.0);
+	// Match the producer/audit homogeneous Beer interpolation and zero-T policy.
+	if (fraction <= 0.0 || a.a <= 0.0) { return a; }
+	if (fraction >= 1.0) { return b; }
+	float ratio = clamp(b.a / a.a, 1e-35, 1.0);
+	float partial = pow(ratio, fraction);
+	float weight = 1.0 - ratio > 1e-5 ? (1.0 - partial) / (1.0 - ratio) : fraction;
+	return vec4(mix(a.rgb, b.rgb, weight), a.a * partial);
+}
+
+vec4 cloud_medium_v2_process(vec2 screen_uv, float z) {
+	uvec2 trace_size = implementation_data.cloud_medium_v2.yz;
+	vec2 coord = clamp(screen_uv * vec2(trace_size) - 0.5, vec2(0.0), vec2(trace_size - uvec2(1u)));
+	ivec2 pixel = ivec2(floor(coord));
+	ivec2 adjacent = min(pixel + 1, ivec2(trace_size) - 1);
+	vec2 weight = fract(coord);
+	vec4 a = cloud_medium_v2_column(pixel, z);
+	vec4 b = cloud_medium_v2_column(ivec2(adjacent.x, pixel.y), z);
+	vec4 c = cloud_medium_v2_column(ivec2(pixel.x, adjacent.y), z);
+	vec4 d = cloud_medium_v2_column(adjacent, z);
+	return a * ((1.0 - weight.x) * (1.0 - weight.y)) + b * (weight.x * (1.0 - weight.y)) +
+		c * ((1.0 - weight.x) * weight.y) + d * (weight.x * weight.y);
+}
+
+// Each ray has its own sorted depth planes, including all shell crossings. Search
+// before spatial filtering: filtering depths first can move a cloud across geometry.
+vec4 cloud_medium_column(ivec2 pixel, float z, int view_layers) {
+	int offset = int(ViewIndex) * view_layers;
+	int lo = 0, hi = view_layers - 1;
+	float last_z = texelFetch(sampler3D(cloud_medium_depth_texture, SAMPLER_LINEAR_CLAMP), ivec3(pixel, offset + hi), 0).r;
+	if (z >= last_z) {
+		return texelFetch(sampler3D(volumetric_fog_texture, SAMPLER_LINEAR_CLAMP), ivec3(pixel, offset + hi), 0);
+	}
+	for (int search = 0; search < 8 && hi - lo > 1; search++) {
+		int mid = (lo + hi) / 2;
+		float depth = texelFetch(sampler3D(cloud_medium_depth_texture, SAMPLER_LINEAR_CLAMP), ivec3(pixel, offset + mid), 0).r;
+		if (depth <= z) { lo = mid; } else { hi = mid; }
+	}
+	float near_z = texelFetch(sampler3D(cloud_medium_depth_texture, SAMPLER_LINEAR_CLAMP), ivec3(pixel, offset + lo), 0).r;
+	float far_z = texelFetch(sampler3D(cloud_medium_depth_texture, SAMPLER_LINEAR_CLAMP), ivec3(pixel, offset + hi), 0).r;
+	vec4 a = texelFetch(sampler3D(volumetric_fog_texture, SAMPLER_LINEAR_CLAMP), ivec3(pixel, offset + lo), 0);
+	vec4 b = texelFetch(sampler3D(volumetric_fog_texture, SAMPLER_LINEAR_CLAMP), ivec3(pixel, offset + hi), 0);
+	float fraction = clamp((z - near_z) / max(far_z - near_z, 1e-6), 0.0, 1.0);
+	if (fraction <= 0.0 || a.a <= 0.0) { return a; }
+	if (fraction >= 1.0) { return b; }
+	// Homogeneous-segment analytic interpolation; T is exponential in metres, not
+	// linear in layer index. This also preserves constant L/T across an empty gap.
+	float ratio = clamp(b.a / a.a, 1e-35, 1.0);
+	float partial = pow(ratio, fraction);
+	float weight = 1.0 - ratio > 1e-5 ? (1.0 - partial) / (1.0 - ratio) : fraction;
+	return vec4(mix(a.rgb, b.rgb, weight), a.a * partial);
+}
+
+// Median extinction mass of the queried prefix, not the whole-ray moment. A
+// cloud behind this receiver must not change the reconstruction of its front
+// medium. The guide is approximate; it does not replace cumulative L/T queries.
+float cloud_medium_prefix_guide(ivec2 pixel, float z, float transmission, int view_layers) {
+	if (transmission >= 1.0) { return 0.0; }
+	float target = 0.5 * (1.0 + clamp(transmission, 0.0, 1.0));
+	int offset = int(ViewIndex) * view_layers;
+	int lo = 0, hi = view_layers - 1;
+	for (int search = 0; search < 8 && hi - lo > 1; search++) {
+		int mid = (lo + hi) / 2;
+		float t = texelFetch(sampler3D(volumetric_fog_texture, SAMPLER_LINEAR_CLAMP), ivec3(pixel, offset + mid), 0).a;
+		if (t > target) { lo = mid; } else { hi = mid; }
+	}
+	float near_z = texelFetch(sampler3D(cloud_medium_depth_texture, SAMPLER_LINEAR_CLAMP), ivec3(pixel, offset + lo), 0).r;
+	float far_z = texelFetch(sampler3D(cloud_medium_depth_texture, SAMPLER_LINEAR_CLAMP), ivec3(pixel, offset + hi), 0).r;
+	float near_t = texelFetch(sampler3D(volumetric_fog_texture, SAMPLER_LINEAR_CLAMP), ivec3(pixel, offset + lo), 0).a;
+	float far_t = texelFetch(sampler3D(volumetric_fog_texture, SAMPLER_LINEAR_CLAMP), ivec3(pixel, offset + hi), 0).a;
+	// The median can fall inside the last partial segment. In that case use
+	// this query's optical endpoint, not a stored plane behind the receiver.
+	if (far_z > z) { far_z = z; far_t = transmission; }
+	float fraction = 0.0;
+	if (near_t > target && near_t > far_t) {
+		// Beer inversion when both endpoints remain representable. A quantized
+		// opaque endpoint has no recoverable logarithmic slope: use a bounded
+		// mass interpolation for the guide only, never for the optical result.
+		fraction = far_t > 0.0 ? log(target / near_t) / log(far_t / near_t) :
+			(near_t - target) / (near_t - far_t);
+	}
+	return clamp(mix(near_z, far_z, clamp(fraction, 0.0, 1.0)), 0.0, z);
+}
+
+float cloud_medium_spatial_weight(float reference_cloud_depth, float reference_coverage,
+		float candidate_cloud_depth, vec4 candidate_medium) {
+	// Clear columns have no representative cloud depth. Never compare a cloud
+	// against a depth that was diluted by zero-depth clear columns. Preserve
+	// bilinear L/T coverage at cloud/clear boundaries; only separate *occupied*
+	// columns whose cloud depths disagree. Use the prefix at the queried surface
+	// depth, not terminal optical thickness, so a cloud behind geometry is clear.
+	float candidate_coverage = clamp(1.0 - candidate_medium.a, 0.0, 1.0);
+	float depth_confidence = reference_coverage * candidate_coverage;
+	float depth_scale = max(24.0, max(reference_cloud_depth, candidate_cloud_depth) * 0.03);
+	float depth_weight = exp(-abs(candidate_cloud_depth - reference_cloud_depth) / depth_scale);
+	return mix(1.0, depth_weight, depth_confidence);
+}
+
 vec4 volumetric_fog_process(vec2 screen_uv, float z) {
+	if (implementation_data.cloud_medium_v2.x != 0u) {
+		return cloud_medium_v2_process(screen_uv, z);
+	}
+	if (implementation_data.volumetric_fog_pad != 0u) {
+		if (z <= 0.0) { return vec4(0.0, 0.0, 0.0, 1.0); }
+		ivec3 size = textureSize(sampler3D(volumetric_fog_texture, SAMPLER_LINEAR_CLAMP), 0);
+		int view_layers = size.z / int(implementation_data.volumetric_fog_pad);
+		vec2 coord = clamp(screen_uv * vec2(size.xy) - 0.5, vec2(0.0), vec2(size.xy - 1));
+		ivec2 pixel = ivec2(floor(coord)), adjacent = min(pixel + 1, size.xy - 1);
+		vec2 weight = fract(coord);
+		vec4 a = cloud_medium_column(pixel, z, view_layers);
+		vec4 b = cloud_medium_column(ivec2(adjacent.x, pixel.y), z, view_layers);
+		vec4 c = cloud_medium_column(ivec2(pixel.x, adjacent.y), z, view_layers);
+		vec4 d = cloud_medium_column(adjacent, z, view_layers);
+		vec4 spatial = vec4((1.0 - weight.x) * (1.0 - weight.y), weight.x * (1.0 - weight.y),
+			(1.0 - weight.x) * weight.y, weight.x * weight.y);
+		vec4 prefix_depth = vec4(cloud_medium_prefix_guide(pixel, z, a.a, view_layers),
+			cloud_medium_prefix_guide(ivec2(adjacent.x, pixel.y), z, b.a, view_layers),
+			cloud_medium_prefix_guide(ivec2(pixel.x, adjacent.y), z, c.a, view_layers),
+			cloud_medium_prefix_guide(adjacent, z, d.a, view_layers));
+		vec4 reference_medium = a * spatial.x + b * spatial.y + c * spatial.z + d * spatial.w;
+		vec4 cloud_coverage = clamp(vec4(1.0 - a.a, 1.0 - b.a, 1.0 - c.a, 1.0 - d.a), 0.0, 1.0);
+		vec4 occupied = spatial * cloud_coverage;
+		float reference_coverage = dot(occupied, vec4(1.0));
+		float reference_cloud_depth = reference_coverage > 1e-6 ?
+			dot(occupied, prefix_depth) / reference_coverage : 0.0;
+		spatial *= vec4(cloud_medium_spatial_weight(reference_cloud_depth, reference_coverage, prefix_depth.x, a),
+			cloud_medium_spatial_weight(reference_cloud_depth, reference_coverage, prefix_depth.y, b),
+			cloud_medium_spatial_weight(reference_cloud_depth, reference_coverage, prefix_depth.z, c),
+			cloud_medium_spatial_weight(reference_cloud_depth, reference_coverage, prefix_depth.w, d));
+		float total = dot(spatial, vec4(1.0));
+		return total > 1e-6 ? (a * spatial.x + b * spatial.y + c * spatial.z + d * spatial.w) / total : reference_medium;
+	}
 	vec3 fog_pos = vec3(screen_uv, z * implementation_data.volumetric_fog_inv_length);
 	if (fog_pos.z < 0.0) {
 		return vec4(0.0, 0.0, 0.0, 1.0);
@@ -1099,6 +1346,22 @@ vec4 volumetric_fog_process(vec2 screen_uv, float z) {
 
 	return texture(sampler3D(volumetric_fog_texture, SAMPLER_LINEAR_CLAMP), fog_pos);
 }
+
+#ifdef MEDIUM_TRANSMISSION_USED
+// Return only the transmitted suffix in camera exposure units. The caller adds
+// its own prefix once, and attenuates reflected/emitted surface light separately.
+vec3 cloud_transmitted_suffix(vec3 color, vec3 weight, vec2 source_uv, vec2 target_uv, float z, vec4 target_prefix) {
+	if (all(equal(source_uv, target_uv))) {
+		// Cancel T algebraically: stable even when the prefix is completely opaque.
+		return max(color - weight * target_prefix.rgb, vec3(0.0));
+	}
+	vec4 source_prefix = volumetric_fog_process(source_uv, z);
+	// RGBA16F cannot carry reliable subnormal transmission. Do not invert lost
+	// information into arbitrarily bright screen-space refraction.
+	if (source_prefix.a < 0.00006103515625) { return vec3(0.0); }
+	return max(color - weight * source_prefix.rgb, vec3(0.0)) * (target_prefix.a / source_prefix.a);
+}
+#endif
 
 vec4 fog_process(vec3 vertex) {
 	vec3 fog_color = scene_data_block.data.fog_light_color;
@@ -1230,6 +1493,11 @@ void fragment_shader(in SceneData scene_data) {
 	float metallic_highp = 0.0;
 	float specular = 0.5;
 	vec3 emission = vec3(0.0);
+#ifdef MEDIUM_TRANSMISSION_USED
+	vec3 medium_transmitted_radiance = vec3(0.0);
+	vec3 medium_transmitted_weight = vec3(0.0);
+	vec2 medium_transmitted_uv = vec2(0.0);
+#endif
 	float roughness_highp = 1.0;
 	float rim = 0.0;
 	float rim_tint = 0.0;
@@ -1498,7 +1766,7 @@ void fragment_shader(in SceneData scene_data) {
 		fog.a = 1.0 - fog.a;
 	}
 
-	if (implementation_data.volumetric_fog_enabled) {
+	if (implementation_data.volumetric_fog_enabled && !has_native_medium()) {
 #ifdef USE_MULTIVIEW
 		vec4 volumetric_fog = volumetric_fog_process(combined_uv, -vertex.z);
 #else
@@ -1682,6 +1950,11 @@ void fragment_shader(in SceneData scene_data) {
 #ifndef MODE_UNSHADED
 	// Used in regular draw pass and when drawing SDFs for SDFGI and materials for VoxelGI.
 	emission *= scene_data.emissive_exposure_normalization;
+#ifdef MEDIUM_TRANSMISSION_USED
+	if (!has_native_medium()) {
+		emission += medium_transmitted_radiance;
+	}
+#endif
 #endif
 
 #if !defined(MODE_RENDER_DEPTH) && !defined(MODE_UNSHADED)
@@ -2643,6 +2916,22 @@ void fragment_shader(in SceneData scene_data) {
 			}
 
 			shadow = mix(1.0, shadow, directional_lights.data[i].shadow_opacity);
+			if (implementation_data.directional_contact_shadow.w > 0.5) {
+				vec3 world_direction = implementation_data.directional_contact_shadow.xyz;
+				vec3 contact_direction = vec3(dot(scene_data.view_matrix[0].xyz, world_direction),
+						dot(scene_data.view_matrix[1].xyz, world_direction), dot(scene_data.view_matrix[2].xyz, world_direction));
+				// Only the matching directional light receives this screen-space shadow.
+				if (dot(contact_direction, directional_lights.data[i].direction) > 0.9999) {
+					ivec3 size = textureSize(sampler2DArray(directional_contact_shadow_texture, SAMPLER_LINEAR_CLAMP), 0);
+					ivec2 pixel = clamp(ivec2(screen_uv * vec2(size.xy)), ivec2(0), size.xy - 1);
+					vec2 contact = texelFetch(sampler2DArray(directional_contact_shadow_texture, SAMPLER_LINEAR_CLAMP), ivec3(pixel, int(ViewIndex)), 0).rg;
+					// Never apply an opaque receiver's mask to a different transparent depth.
+					float depth_error = max(0.001, abs(vertex.z) * 0.00001) + fwidth(vertex.z);
+					if (contact.y > 0.0 && abs(contact.y + vertex.z) <= depth_error) {
+						shadow = min(shadow, clamp(contact.x, 0.0, 1.0));
+					}
+				}
+			}
 #endif
 
 			blur_shadow(shadow);
@@ -3078,9 +3367,19 @@ void fragment_shader(in SceneData scene_data) {
 #endif
 
 #ifndef FOG_DISABLED
-	diffuse_buffer.rgb = diffuse_buffer.rgb * fog.a + fog.rgb;
-	specular_buffer.rgb = specular_buffer.rgb * fog.a;
+	if (!has_native_medium()) {
+		diffuse_buffer.rgb = diffuse_buffer.rgb * fog.a + fog.rgb;
+		specular_buffer.rgb = specular_buffer.rgb * fog.a;
+	}
 #endif //!FOG_DISABLED
+	if (has_native_medium()) {
+		vec4 medium = volumetric_fog_process(screen_uv, -vertex.z);
+		diffuse_buffer.rgb = diffuse_buffer.rgb * medium.a + medium.rgb;
+		specular_buffer.rgb *= medium.a;
+#ifdef MEDIUM_TRANSMISSION_USED
+		diffuse_buffer.rgb += cloud_transmitted_suffix(medium_transmitted_radiance, medium_transmitted_weight, medium_transmitted_uv, screen_uv, -vertex.z, medium);
+#endif
+	}
 
 #else //MODE_SEPARATE_SPECULAR
 
@@ -3094,8 +3393,20 @@ void fragment_shader(in SceneData scene_data) {
 #endif //USE_NO_SHADING
 
 #ifndef FOG_DISABLED
-	frag_color.rgb = frag_color.rgb * fog.a + fog.rgb;
+	if (!has_native_medium()) {
+		frag_color.rgb = frag_color.rgb * fog.a + fog.rgb;
+	}
 #endif //!FOG_DISABLED
+	if (has_native_medium()) {
+		vec4 medium = volumetric_fog_process(screen_uv, -vertex.z);
+		frag_color.rgb *= medium.a;
+#ifndef CLOUD_ADDITIVE_SURFACE
+		frag_color.rgb += medium.rgb;
+#endif
+#ifdef MEDIUM_TRANSMISSION_USED
+		frag_color.rgb += cloud_transmitted_suffix(medium_transmitted_radiance, medium_transmitted_weight, medium_transmitted_uv, screen_uv, -vertex.z, medium);
+#endif
+	}
 
 #if defined(PREMUL_ALPHA_USED) && !defined(MODE_RENDER_DEPTH)
 	frag_color.rgb *= premul_alpha;

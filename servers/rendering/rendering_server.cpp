@@ -151,14 +151,17 @@ RID RenderingServer::get_test_texture() {
 }
 
 void RenderingServer::_free_internal_rids() {
+	if (test_material.is_valid()) {
+		free_rid(test_material);
+		test_material = RID();
+	}
 	if (test_texture.is_valid()) {
 		free_rid(test_texture);
+		test_texture = RID();
 	}
 	if (white_texture.is_valid()) {
 		free_rid(white_texture);
-	}
-	if (test_material.is_valid()) {
-		free_rid(test_material);
+		white_texture = RID();
 	}
 }
 

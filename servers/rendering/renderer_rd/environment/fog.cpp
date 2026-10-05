@@ -523,7 +523,47 @@ void Fog::VolumetricFog::init(const Vector3i &fog_size, RID p_sky_shader) {
 	sky_uniform_set = RD::get_singleton()->uniform_set_create(uniforms, p_sky_shader, RendererRD::SkyRD::SKY_SET_FOG);
 }
 
+void Fog::VolumetricFog::configure_local_medium_capture(bool p_enabled) {
+	if (local_medium_coefficients.is_valid() && local_medium_emission.is_valid() && local_medium_source.is_valid() && local_medium_direct_source.is_valid() && local_medium_capture == p_enabled) { return; }
+	// Establish complete tiny fallbacks first; failure of a large diagnostic
+	// allocation must not invalidate ordinary fog's density descriptor set.
+	if (p_enabled && local_medium_coefficients.is_null()) { configure_local_medium_capture(false); }
+	RD::TextureFormat format;
+	format.texture_type = RD::TEXTURE_TYPE_3D;
+	format.format = RD::DATA_FORMAT_R32G32B32A32_SFLOAT;
+	format.width = p_enabled ? width : 1;
+	format.height = p_enabled ? height : 1;
+	format.depth = p_enabled ? depth : 1;
+	format.usage_bits = RD::TEXTURE_USAGE_STORAGE_BIT | RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_CAN_COPY_FROM_BIT;
+	RID replacements[4];
+	for (uint32_t i = 0; i < 4; i++) {
+		replacements[i] = RD::get_singleton()->texture_create(format, RD::TextureView());
+		if (replacements[i].is_null()) {
+			for (uint32_t j = 0; j < i; j++) { RD::get_singleton()->free_rid(replacements[j]); }
+			ERR_PRINT("Local fog capture allocation failed; retaining the complete previous generation.");
+			return;
+		}
+	}
+	// Commit only once all four allocations succeeded. Bound sets must retire
+	// together before their images. RD defers physical destruction past GPU use.
+	local_medium_history_reset = local_medium_coefficients.is_valid();
+	sync_gi_dependent_sets_validity(true);
+	for (RID texture : { local_medium_coefficients, local_medium_emission, local_medium_source, local_medium_direct_source }) {
+		if (texture.is_valid()) { RD::get_singleton()->free_rid(texture); }
+	}
+	local_medium_coefficients = replacements[0];
+	local_medium_emission = replacements[1];
+	local_medium_source = replacements[2];
+	local_medium_direct_source = replacements[3];
+	local_medium_capture = p_enabled;
+	local_medium_recorded = false;
+}
+
 Fog::VolumetricFog::~VolumetricFog() {
+	sync_gi_dependent_sets_validity(true);
+	for (RID texture : { local_medium_coefficients, local_medium_emission, local_medium_source, local_medium_direct_source }) {
+		if (texture.is_valid()) { RD::get_singleton()->free_rid(texture); }
+	}
 	RD::get_singleton()->free_rid(prev_light_density_map);
 	RD::get_singleton()->free_rid(light_density_map);
 	RD::get_singleton()->free_rid(fog_map);
@@ -573,6 +613,12 @@ void Fog::volumetric_fog_update(const VolumetricFogSettings &p_settings, const P
 	RD::get_singleton()->draw_command_begin_label("Volumetric Fog");
 
 	Ref<VolumetricFog> fog = p_settings.vfog;
+	fog->configure_local_medium_capture(p_settings.capture_local_medium);
+	fog->local_medium_recorded = false;
+	const bool local_medium_active = p_settings.capture_local_medium && fog->local_medium_capture;
+	if (fog->local_medium_active != local_medium_active) { fog->local_medium_history_reset = true; }
+	fog->local_medium_active = local_medium_active;
+	ERR_FAIL_COND(fog->local_medium_coefficients.is_null() || fog->local_medium_emission.is_null() || fog->local_medium_source.is_null() || fog->local_medium_direct_source.is_null());
 
 	if (p_fog_volumes.size() > 0) {
 		RD::get_singleton()->draw_command_begin_label("Render Volumetric Fog Volumes");
@@ -610,7 +656,7 @@ void Fog::volumetric_fog_update(const VolumetricFogSettings &p_settings, const P
 		params.fog_volume_size[1] = fog->height;
 		params.fog_volume_size[2] = fog->depth;
 
-		params.use_temporal_reprojection = RendererSceneRenderRD::get_singleton()->environment_get_volumetric_fog_temporal_reprojection(p_settings.env);
+		params.use_temporal_reprojection = !fog->local_medium_active && !fog->local_medium_history_reset && RendererSceneRenderRD::get_singleton()->environment_get_volumetric_fog_temporal_reprojection(p_settings.env);
 		params.temporal_frame = RSG::rasterizer->get_frame_number() % VolumetricFog::MAX_TEMPORAL_FRAMES;
 		params.detail_spread = RendererSceneRenderRD::get_singleton()->environment_get_volumetric_fog_detail_spread(p_settings.env);
 		params.temporal_blend = RendererSceneRenderRD::get_singleton()->environment_get_volumetric_fog_temporal_reprojection_amount(p_settings.env);
@@ -1024,6 +1070,14 @@ void Fog::volumetric_fog_update(const VolumetricFogSettings &p_settings, const P
 
 			uniforms.remove_at(9);
 			uniforms.write[8].set_id(0, aux8);
+			const RID local_medium_maps[] = { fog->local_medium_coefficients, fog->local_medium_emission, fog->local_medium_source, fog->local_medium_direct_source };
+			for (uint32_t i = 0; i < 4; i++) {
+				RD::Uniform u;
+				u.uniform_type = RD::UNIFORM_TYPE_IMAGE;
+				u.binding = 22 + i;
+				u.append_id(local_medium_maps[i]);
+				uniforms.push_back(u);
+			}
 			fog->gi_dependent_sets.process_uniform_set_density = RD::get_singleton()->uniform_set_create(uniforms, volumetric_fog.process_shader.version_get_shader(volumetric_fog.process_shader_version, _get_fog_process_variant(VolumetricFogShader::VOLUMETRIC_FOG_PROCESS_SHADER_DENSITY)), 0);
 		}
 	}
@@ -1138,7 +1192,9 @@ void Fog::volumetric_fog_update(const VolumetricFogSettings &p_settings, const P
 	Transform3D to_prev_cam_view = p_prev_cam_inv_transform * p_cam_transform;
 	RendererRD::MaterialStorage::store_transform(to_prev_cam_view, params.to_prev_view);
 
-	params.use_temporal_reprojection = RendererSceneRenderRD::get_singleton()->environment_get_volumetric_fog_temporal_reprojection(p_settings.env);
+	params.use_temporal_reprojection = !fog->local_medium_active && !fog->local_medium_history_reset && RendererSceneRenderRD::get_singleton()->environment_get_volumetric_fog_temporal_reprojection(p_settings.env);
+	params.capture_local_medium = fog->local_medium_active;
+	params.direct_camera_normalization = p_settings.direct_camera_normalization;
 	params.temporal_blend = RendererSceneRenderRD::get_singleton()->environment_get_volumetric_fog_temporal_reprojection_amount(p_settings.env);
 
 	RID sky_rid = RendererSceneRenderRD::get_singleton()->environment_get_sky(p_settings.env);
@@ -1182,6 +1238,15 @@ void Fog::volumetric_fog_update(const VolumetricFogSettings &p_settings, const P
 	}
 	RD::get_singleton()->compute_list_dispatch_threads(compute_list, fog->width, fog->height, fog->depth);
 	RD::get_singleton()->compute_list_add_barrier(compute_list);
+	// This is an enqueue receipt, not GPU completion or a consumer lease.
+	fog->local_medium_recorded = fog->local_medium_active;
+	fog->local_medium_camera = p_cam_transform;
+	fog->local_medium_projection = p_cam_projection;
+	fog->local_medium_frame = RSG::rasterizer->get_frame_number();
+	fog->local_medium_camera_normalization = p_settings.direct_camera_normalization;
+	fog->local_medium_phase_g = params.phase_g;
+	fog->local_medium_physical_light_units = RendererSceneRenderRD::get_singleton()->is_using_physical_light_units();
+	fog->local_medium_history_reset = false;
 
 	// Copy fog to history buffer
 	if (RendererSceneRenderRD::get_singleton()->environment_get_volumetric_fog_temporal_reprojection(p_settings.env)) {

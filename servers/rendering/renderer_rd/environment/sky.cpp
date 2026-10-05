@@ -1150,6 +1150,7 @@ void SkyRD::setup_sky(const RenderDataRD *p_render_data, const Size2i p_screen_s
 
 	// Setup fog variables.
 	sky_scene_state.ubo.volumetric_fog_enabled = false;
+	sky_scene_state.ubo.pad1 = 0;
 	if (p_render_data->render_buffers->has_custom_data(RB_SCOPE_FOG)) {
 		Ref<RendererRD::Fog::VolumetricFog> fog = p_render_data->render_buffers->get_custom_data(RB_SCOPE_FOG);
 		sky_scene_state.ubo.volumetric_fog_enabled = true;
@@ -1458,6 +1459,20 @@ void SkyRD::update_res_buffers(Ref<RenderSceneBuffersRD> p_render_buffers, RID p
 	}
 
 	RD::get_singleton()->draw_command_end_label(); // Setup Sky resolution buffers
+}
+
+void SkyRD::update_cloud_medium(Ref<RenderSceneBuffersRD> p_render_buffers) {
+	if (p_render_buffers.is_null() || p_render_buffers->cloud_medium.is_null()) { return; }
+	RD::Uniform medium;
+	medium.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
+	medium.binding = 0;
+	medium.append_id(p_render_buffers->cloud_medium);
+	sky_scene_state.fog_uniform_set = UniformSetCacheRD::get_singleton()->get_cache(sky_shader.default_shader_rd, SKY_SET_FOG, medium);
+	sky_scene_state.ubo.volumetric_fog_enabled = true;
+	sky_scene_state.ubo.volumetric_fog_sky_affect = 1.0;
+	sky_scene_state.ubo.pad1 = p_render_buffers->get_view_count();
+	sky_scene_state.ubo.fog_use_legacy_blending = false;
+	RD::get_singleton()->buffer_update(sky_scene_state.uniform_buffer, 0, sizeof(SkySceneState::UBO), &sky_scene_state.ubo);
 }
 
 void SkyRD::draw_sky(RD::DrawListID p_draw_list, Ref<RenderSceneBuffersRD> p_render_buffers, RID p_env, RID p_fb, double p_time, float p_luminance_multiplier, float p_brightness_multiplier) {

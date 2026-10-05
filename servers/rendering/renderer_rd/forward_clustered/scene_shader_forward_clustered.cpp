@@ -77,6 +77,7 @@ void SceneShaderForwardClustered::ShaderData::set_code(const String &p_code) {
 	unshaded = false;
 	uses_vertex = false;
 	uses_position = false;
+	writes_depth = false;
 	uses_sss = false;
 	uses_transmittance = false;
 	uses_time = false;
@@ -153,6 +154,7 @@ void SceneShaderForwardClustered::ShaderData::set_code(const String &p_code) {
 	actions.write_flag_pointers["PROJECTION_MATRIX"] = &writes_modelview_or_projection;
 	actions.write_flag_pointers["VERTEX"] = &uses_vertex;
 	actions.write_flag_pointers["POSITION"] = &uses_position;
+	actions.write_flag_pointers["DEPTH"] = &writes_depth;
 	actions.write_flag_pointers["TANGENT"] = &writes_tangent;
 	actions.write_flag_pointers["BINORMAL"] = &writes_tangent;
 	actions.write_flag_pointers["Z_CLIP_SCALE"] = &uses_z_clip_scale;
@@ -237,6 +239,9 @@ void SceneShaderForwardClustered::ShaderData::set_code(const String &p_code) {
 	print_line("\n**vertex_globals:\n" + gen_code.stage_globals[ShaderCompiler::STAGE_VERTEX]);
 	print_line("\n**fragment_globals:\n" + gen_code.stage_globals[ShaderCompiler::STAGE_FRAGMENT]);
 #endif
+	if (blend_mode == BLEND_MODE_ADD) {
+		gen_code.defines.push_back("#define CLOUD_ADDITIVE_SURFACE\n");
+	}
 	SceneShaderForwardClustered::singleton->shader.version_set_code(version, gen_code.code, gen_code.uniforms, gen_code.stage_globals[ShaderCompiler::STAGE_VERTEX], gen_code.stage_globals[ShaderCompiler::STAGE_FRAGMENT], gen_code.defines);
 
 	ubo_size = gen_code.uniform_total_size;
@@ -781,6 +786,9 @@ void SceneShaderForwardClustered::init(const String p_defines) {
 		actions.renames["SCREEN_UV"] = "screen_uv";
 		actions.renames["DEPTH"] = "gl_FragDepth";
 		actions.renames["FOG"] = "fog";
+		actions.renames["MEDIUM_TRANSMITTED_RADIANCE"] = "medium_transmitted_radiance";
+		actions.renames["MEDIUM_TRANSMITTED_WEIGHT"] = "medium_transmitted_weight";
+		actions.renames["MEDIUM_TRANSMITTED_UV"] = "medium_transmitted_uv";
 		actions.renames["RADIANCE"] = "custom_radiance";
 		actions.renames["IRRADIANCE"] = "custom_irradiance";
 		actions.renames["BONE_INDICES"] = "bone_attrib";
@@ -859,6 +867,9 @@ void SceneShaderForwardClustered::init(const String p_defines) {
 		actions.usage_defines["SCREEN_UV"] = "#define SCREEN_UV_USED\n";
 
 		actions.usage_defines["FOG"] = "#define CUSTOM_FOG_USED\n";
+		actions.usage_defines["MEDIUM_TRANSMITTED_RADIANCE"] = "#define MEDIUM_TRANSMISSION_USED\n";
+		actions.usage_defines["MEDIUM_TRANSMITTED_WEIGHT"] = "#define MEDIUM_TRANSMISSION_USED\n";
+		actions.usage_defines["MEDIUM_TRANSMITTED_UV"] = "#define MEDIUM_TRANSMISSION_USED\n";
 		actions.usage_defines["RADIANCE"] = "#define CUSTOM_RADIANCE_USED\n";
 		actions.usage_defines["IRRADIANCE"] = "#define CUSTOM_IRRADIANCE_USED\n";
 

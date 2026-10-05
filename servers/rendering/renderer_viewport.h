@@ -245,6 +245,7 @@ public:
 	void viewport_set_clear_mode(RID p_viewport, RSE::ViewportClearMode p_clear_mode);
 
 	RID viewport_get_render_target(RID p_viewport) const;
+	RID viewport_get_camera(RID p_viewport) const;
 	RID viewport_get_texture(RID p_viewport) const;
 	RID viewport_get_occluder_debug_texture(RID p_viewport) const;
 

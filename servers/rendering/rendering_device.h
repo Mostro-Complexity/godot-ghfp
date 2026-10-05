@@ -366,6 +366,9 @@ public:
 		bool is_subsampled = false;
 		bool has_initial_data = false;
 		bool pending_clear = false;
+		// Only texture_create() owns a fresh RD allocation. Imported images may
+		// alias another RID outside this RenderingDevice's ownership graph.
+		bool storage_identity_proven = false;
 
 		BitField<RDD::TextureAspectBits> read_aspect_flags = {};
 		BitField<RDD::TextureAspectBits> barrier_aspect_flags = {};
@@ -436,6 +439,12 @@ public:
 	};
 
 public:
+	enum TextureStorageOverlap {
+		TEXTURE_STORAGE_OVERLAP_UNKNOWN,
+		TEXTURE_STORAGE_OVERLAP_DISJOINT,
+		TEXTURE_STORAGE_OVERLAP_OVERLAP,
+	};
+
 	struct TextureView {
 		DataFormat format_override = DATA_FORMAT_MAX; // // Means, use same as format.
 		TextureSwizzle swizzle_r = TEXTURE_SWIZZLE_R;
@@ -471,6 +480,10 @@ public:
 	bool texture_is_format_supported_for_usage(DataFormat p_format, BitField<TextureUsageBits> p_usage) const;
 	bool texture_is_shared(RID p_texture);
 	bool texture_is_valid(RID p_texture);
+	// Read-only instantaneous query; it neither retains RIDs nor grants a GPU
+	// use lease. DISJOINT requires distinct RD-owned allocations or proven
+	// nonintersecting 2D/2D-array subresource ranges.
+	TextureStorageOverlap texture_storage_overlap(RID p_first, RID p_second);
 	TextureFormat texture_get_format(RID p_texture);
 	Size2i texture_size(RID p_texture);
 #ifndef DISABLE_DEPRECATED
@@ -1057,6 +1070,9 @@ public:
 	RID _storage_buffer_create(uint32_t p_size_bytes, const Vector<uint8_t> &p_data, BitField<StorageBufferUsage> p_usage = 0, BitField<BufferCreationBits> p_creation_bits = 0) {
 		return storage_buffer_create(p_size_bytes, p_data, p_usage, p_creation_bits);
 	}
+	// Internal render-thread queries for validating borrowed storage-buffer descriptors without readback.
+	bool storage_buffer_is_valid(RID p_buffer) const;
+	uint32_t storage_buffer_get_size(RID p_buffer);
 
 	RID texture_buffer_create(uint32_t p_size_elements, DataFormat p_format, Span<uint8_t> p_data = {});
 	RID _texture_buffer_create(uint32_t p_size_elements, DataFormat p_format, const Vector<uint8_t> &p_data) {
@@ -2029,6 +2045,7 @@ VARIANT_ENUM_CAST(RenderingDevice::CompareOperator)
 VARIANT_ENUM_CAST(RenderingDevice::DataFormat)
 VARIANT_ENUM_CAST(RenderingDevice::TextureType)
 VARIANT_ENUM_CAST(RenderingDevice::TextureSamples)
+VARIANT_ENUM_CAST(RenderingDevice::TextureStorageOverlap)
 VARIANT_BITFIELD_CAST(RenderingDevice::TextureUsageBits)
 VARIANT_ENUM_CAST(RenderingDevice::TextureSwizzle)
 VARIANT_ENUM_CAST(RenderingDevice::TextureSliceType)

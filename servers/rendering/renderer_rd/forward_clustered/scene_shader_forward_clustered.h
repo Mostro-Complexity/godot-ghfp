@@ -258,6 +258,7 @@ public:
 		bool unshaded = false;
 		bool uses_vertex = false;
 		bool uses_position = false;
+		bool writes_depth = false;
 		bool uses_sss = false;
 		bool uses_transmittance = false;
 		bool uses_screen_texture = false;
@@ -298,7 +299,9 @@ public:
 
 		_FORCE_INLINE_ bool uses_shared_shadow_material() const {
 			bool backface_culling = cull_mode == RSE::CULL_MODE_BACK;
-			return !uses_particle_trails && !writes_modelview_or_projection && !uses_vertex && !uses_position && !uses_discard && !uses_depth_prepass_alpha && !uses_alpha_clip && !uses_alpha_antialiasing && backface_culling && !uses_point_size && !uses_world_coordinates && !wireframe && !uses_z_clip_scale && !stencil_enabled;
+			// The shared depth-only material cannot reproduce custom fragment depth.
+			// Retain the original shader in depth/shadow passes just as for POSITION.
+			return !uses_particle_trails && !writes_modelview_or_projection && !uses_vertex && !uses_position && !writes_depth && !uses_discard && !uses_depth_prepass_alpha && !uses_alpha_clip && !uses_alpha_antialiasing && backface_culling && !uses_point_size && !uses_world_coordinates && !wireframe && !uses_z_clip_scale && !stencil_enabled;
 		}
 
 		virtual void set_code(const String &p_Code);

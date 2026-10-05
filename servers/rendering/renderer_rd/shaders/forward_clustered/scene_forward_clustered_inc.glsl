@@ -340,6 +340,11 @@ struct ImplementationData {
 	float volumetric_fog_inv_length;
 	float volumetric_fog_detail_spread;
 	uint volumetric_fog_pad;
+	vec4 directional_contact_shadow;
+	uvec4 cloud_medium_v2;
+	uvec4 cloud_medium_v2_pool;
+	uvec4 cloud_medium_v2_status;
+	uvec4 cloud_medium_v2_validation;
 };
 
 layout(set = 1, binding = 1, std140) uniform ImplementationDataBlock {
@@ -469,6 +474,18 @@ layout(set = 1, binding = 32, std140) uniform VoxelGIs {
 voxel_gi_instances;
 
 layout(set = 1, binding = 33) uniform texture3D volumetric_fog_texture;
+layout(set = 1, binding = 37) uniform texture3D cloud_medium_depth_texture;
+layout(set = 1, binding = 38) uniform texture2DArray directional_contact_shadow_texture;
+layout(set = 1, binding = 39) uniform texture3D cloud_medium_moments_texture;
+layout(set = 1, binding = 40, std430) buffer restrict readonly CloudMediumV2RayMap {
+	uint data[];
+} cloud_medium_v2_ray_map;
+layout(set = 1, binding = 41, std430) buffer restrict readonly CloudMediumV2ExceptionLT {
+	uvec2 data[];
+} cloud_medium_v2_exception_lt;
+layout(set = 1, binding = 42, std430) buffer restrict readonly CloudMediumV2ExceptionDepth {
+	float data[];
+} cloud_medium_v2_exception_depth;
 
 #ifdef USE_MULTIVIEW
 layout(set = 1, binding = 34) uniform texture2DArray ssil_buffer;

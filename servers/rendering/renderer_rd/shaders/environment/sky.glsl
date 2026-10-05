@@ -148,6 +148,16 @@ vec3 interleaved_gradient_noise(vec2 pos) {
 #endif
 
 vec4 volumetric_fog_process(vec2 screen_uv) {
+	if (sky_scene_data.pad1 != 0u) {
+		float views = float(sky_scene_data.pad1);
+		float total_layers = float(textureSize(sampler3D(volumetric_fog_texture, SAMPLER_LINEAR_CLAMP), 0).z);
+#ifdef USE_MULTIVIEW
+		float view = float(ViewIndex);
+#else
+		float view = 0.0;
+#endif
+		return texture(sampler3D(volumetric_fog_texture, SAMPLER_LINEAR_CLAMP), vec3(screen_uv, (view + 1.0) / views - 0.5 / total_layers));
+	}
 #ifdef USE_MULTIVIEW
 	vec4 reprojected = sky_scene_data.combined_reprojection[ViewIndex] * vec4(screen_uv * 2.0 - 1.0, 0.0, 1.0); // Unproject at the far plane
 	vec3 fog_pos = vec3(reprojected.xy / reprojected.w, 1.0) * 0.5 + 0.5;

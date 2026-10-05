@@ -32,10 +32,14 @@
 #include "render_scene_buffers_rd.compat.inc"
 
 #include "core/object/class_db.h"
+#include "servers/rendering/renderer_rd/environment/fog.h"
 #include "servers/rendering/renderer_rd/storage_rd/texture_storage.h"
 #include "servers/rendering/rendering_device_binds.h"
 #include "servers/rendering/rendering_server.h" // IWYU pragma: keep // Needed to bind RSE enums.
 #include "servers/rendering/rendering_server_enums.h"
+
+#include <cmath>
+#include <cstring>
 
 RenderSceneBuffersRD::RenderSceneBuffersRD() {
 }
@@ -49,6 +53,18 @@ RenderSceneBuffersRD::~RenderSceneBuffersRD() {
 }
 
 void RenderSceneBuffersRD::_bind_methods() {
+	ClassDB::bind_method(D_METHOD("set_cloud_medium", "texture", "far_distance"), &RenderSceneBuffersRD::set_cloud_medium);
+	ClassDB::bind_method(D_METHOD("set_cloud_medium_depth", "texture"), &RenderSceneBuffersRD::set_cloud_medium_depth);
+	ClassDB::bind_method(D_METHOD("set_cloud_medium_moments", "texture"), &RenderSceneBuffersRD::set_cloud_medium_moments);
+	ClassDB::bind_method(D_METHOD("set_cloud_medium_compact_v2", "eye_descriptors"), &RenderSceneBuffersRD::set_cloud_medium_compact_v2);
+#ifdef DEV_ENABLED
+	ClassDB::bind_method(D_METHOD("debug_validate_cloud_medium_compact_v2_stereo", "eye_descriptors"), &RenderSceneBuffersRD::debug_validate_cloud_medium_compact_v2_stereo);
+#endif
+	ClassDB::bind_method(D_METHOD("set_directional_contact_shadow", "texture", "direction_world"), &RenderSceneBuffersRD::set_directional_contact_shadow);
+	ClassDB::bind_method(D_METHOD("get_local_fog_texture"), &RenderSceneBuffersRD::get_local_fog_texture);
+	ClassDB::bind_method(D_METHOD("get_local_fog_range"), &RenderSceneBuffersRD::get_local_fog_range);
+	ClassDB::bind_method(D_METHOD("request_local_fog_medium_capture", "enabled"), &RenderSceneBuffersRD::request_local_fog_medium_capture);
+	ClassDB::bind_method(D_METHOD("get_local_fog_medium_capture"), &RenderSceneBuffersRD::get_local_fog_medium_capture);
 	ClassDB::bind_method(D_METHOD("has_texture", "context", "name"), &RenderSceneBuffersRD::has_texture);
 	ClassDB::bind_method(D_METHOD("create_texture", "context", "name", "data_format", "usage_bits", "texture_samples", "size", "layers", "mipmaps", "unique", "discardable"), &RenderSceneBuffersRD::create_texture);
 	ClassDB::bind_method(D_METHOD("create_texture_from_format", "context", "name", "format", "view", "unique"), &RenderSceneBuffersRD::_create_texture_from_format);
@@ -80,6 +96,379 @@ void RenderSceneBuffersRD::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_screen_space_aa"), &RenderSceneBuffersRD::get_screen_space_aa);
 	ClassDB::bind_method(D_METHOD("get_use_taa"), &RenderSceneBuffersRD::get_use_taa);
 	ClassDB::bind_method(D_METHOD("get_use_debanding"), &RenderSceneBuffersRD::get_use_debanding);
+}
+
+#ifdef DEV_ENABLED
+bool RenderSceneBuffersRD::debug_validate_cloud_medium_compact_v2_stereo(TypedArray<Dictionary> p_eye_descriptors) {
+	ERR_NOT_ON_RENDER_THREAD_V(false);
+	Ref<RenderSceneBuffersRD> probe;
+	probe.instantiate();
+	probe->view_count = 2;
+	probe->internal_size = internal_size;
+	return probe->set_cloud_medium_compact_v2(p_eye_descriptors);
+}
+#endif
+
+bool RenderSceneBuffersRD::set_cloud_medium_compact_v2(TypedArray<Dictionary> p_eye_descriptors) {
+	// ClassDB calls this during compositor rendering; descriptors and borrowed RIDs
+	// are only mutated on the render thread and remain alive through the last consumer.
+	ERR_NOT_ON_RENDER_THREAD_V(false);
+	auto reject = [this](const String &p_reason) {
+		set_cloud_medium(RID(), 0.0f);
+		ERR_PRINT(p_reason);
+		return false;
+	};
+	if (p_eye_descriptors.size() != view_count || p_eye_descriptors.is_empty()) {
+		return reject("Compact cloud-medium v2 requires one complete descriptor per RenderSceneBuffersRD view.");
+	}
+
+	RD *rd = RD::get_singleton();
+	if (rd == nullptr) {
+		return reject("Compact cloud-medium v2 requires an active RenderingDevice.");
+	}
+	Vector<CloudMediumCompactDescriptor> descriptors;
+	descriptors.resize(view_count);
+	int64_t common_allocation_generation = -1;
+	int64_t common_frame_generation = -1;
+	int64_t common_weather_generation = -1;
+	int64_t common_lighting_generation = -1;
+	int32_t common_candidate_layers = -1;
+
+	auto get_integer = [](const Dictionary &p_dictionary, const char *p_key, int64_t &r_value) {
+		Variant value = p_dictionary.get(StringName(p_key), Variant());
+		if (value.get_type() != Variant::INT) {
+			return false;
+		}
+		r_value = value;
+		return true;
+	};
+	auto get_rid = [](const Dictionary &p_dictionary, const char *p_key, RID &r_value) {
+		Variant value = p_dictionary.get(StringName(p_key), Variant());
+		if (value.get_type() != Variant::RID) {
+			return false;
+		}
+		r_value = value;
+		return true;
+	};
+	auto get_size = [](const Dictionary &p_dictionary, const char *p_key, Vector2i &r_value) {
+		Variant value = p_dictionary.get(StringName(p_key), Variant());
+		if (value.get_type() != Variant::VECTOR2I) {
+			return false;
+		}
+		r_value = value;
+		return true;
+	};
+	auto get_extent = [](const Dictionary &p_dictionary, const char *p_key, Vector3i &r_value) {
+		Variant value = p_dictionary.get(StringName(p_key), Variant());
+		if (value.get_type() != Variant::VECTOR3I) {
+			return false;
+		}
+		r_value = value;
+		return true;
+	};
+	auto get_string = [](const Dictionary &p_dictionary, const char *p_key, String &r_value) {
+		Variant value = p_dictionary.get(StringName(p_key), Variant());
+		if (value.get_type() != Variant::STRING) {
+			return false;
+		}
+		r_value = value;
+		return true;
+	};
+	auto fits_i32 = [](int64_t p_value) { return p_value >= INT32_MIN && p_value <= INT32_MAX; };
+	auto texture_matches = [rd](RID p_rid, RD::DataFormat p_format, int32_t p_width, int32_t p_height, uint32_t p_depth) {
+		if (!rd->texture_is_valid(p_rid)) {
+			return false;
+		}
+		const RD::TextureFormat format = rd->texture_get_format(p_rid);
+		const uint32_t required_usage = RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT;
+		return format.format == p_format && format.texture_type == RD::TEXTURE_TYPE_3D && format.width == (uint32_t)p_width && format.height == (uint32_t)p_height &&
+			format.depth == p_depth && format.array_layers == 1 && (format.usage_bits & required_usage) == required_usage;
+	};
+	auto multiply_size = [](uint64_t p_a, uint64_t p_b, uint64_t &r_product) {
+		if (p_b != 0 && p_a > UINT64_MAX / p_b) {
+			return false;
+		}
+		r_product = p_a * p_b;
+		return true;
+	};
+
+	for (uint32_t eye = 0; eye < view_count; eye++) {
+		const Dictionary dictionary = p_eye_descriptors[eye];
+		CloudMediumCompactDescriptor descriptor;
+		int64_t format_version = -1;
+		int64_t eye_index = -1;
+		int64_t eye_count = -1;
+		int64_t candidate_layers = -1;
+		int64_t slot_capacity = -1;
+		int64_t pool_capacity = -1;
+		if (!get_integer(dictionary, "format_version", format_version) || !fits_i32(format_version) ||
+				!get_integer(dictionary, "eye_index", eye_index) || !fits_i32(eye_index) ||
+				!get_integer(dictionary, "eye_count", eye_count) || !fits_i32(eye_count) ||
+				!get_integer(dictionary, "candidate_layers", candidate_layers) || !fits_i32(candidate_layers) ||
+				!get_integer(dictionary, "slot_capacity", slot_capacity) || !fits_i32(slot_capacity) ||
+				!get_integer(dictionary, "pool_capacity", pool_capacity) || !fits_i32(pool_capacity) ||
+				!get_size(dictionary, "trace_size", descriptor.trace_size) || !get_size(dictionary, "output_size", descriptor.output_size) ||
+				!get_integer(dictionary, "allocation_generation", descriptor.allocation_generation) ||
+				!get_integer(dictionary, "frame_generation", descriptor.frame_generation) ||
+				!get_integer(dictionary, "weather_generation", descriptor.weather_generation) ||
+				!get_integer(dictionary, "lighting_generation", descriptor.lighting_generation) ||
+				!get_rid(dictionary, "lt_texture", descriptor.lt_texture) ||
+				!get_rid(dictionary, "depth_texture", descriptor.depth_texture) ||
+				!get_rid(dictionary, "ray_map", descriptor.ray_map) ||
+				!get_rid(dictionary, "exception_lt_pool", descriptor.exception_lt_pool) ||
+				!get_rid(dictionary, "exception_depth_pool", descriptor.exception_depth_pool)) {
+			return reject("Compact cloud-medium v2 eye descriptor is missing a field or has a mismatched Variant type.");
+		}
+		if (dictionary.has("direct_resources")) {
+			return reject("Compact cloud-medium v2 rejects the obsolete opaque direct_resources uniform-set RID.");
+		}
+		descriptor.format_version = (int32_t)format_version;
+		descriptor.eye_index = (int32_t)eye_index;
+		descriptor.eye_count = (int32_t)eye_count;
+		descriptor.candidate_layers = (int32_t)candidate_layers;
+		descriptor.slot_capacity = (int32_t)slot_capacity;
+		descriptor.pool_capacity = (int32_t)pool_capacity;
+
+		if (descriptor.format_version != 2 || descriptor.eye_index != eye || descriptor.eye_count != view_count ||
+				descriptor.trace_size.x <= 0 || descriptor.trace_size.y <= 0 || descriptor.output_size != internal_size ||
+				descriptor.slot_capacity != 24 || descriptor.pool_capacity > 0x3fffffff ||
+				descriptor.allocation_generation < 0 || descriptor.frame_generation < 0 || descriptor.weather_generation < 0 || descriptor.lighting_generation < 0) {
+			return reject("Compact cloud-medium v2 eye descriptor violates version, dimensions, eye, capacity, or generation constraints.");
+		}
+		if (descriptor.candidate_layers != 96 || descriptor.pool_capacity < 1) {
+			return reject("Compact cloud-medium v2 pinned producer requires candidate_layers=96 and pool_capacity>=1.");
+		}
+		Variant direct_value = dictionary.get("direct_inputs", Variant());
+		if (direct_value.get_type() != Variant::DICTIONARY) {
+			return reject("Compact cloud-medium v2 requires typed direct_inputs for every eye.");
+		}
+		const Dictionary direct_dictionary = direct_value;
+		CloudDirectInputs &direct = descriptor.direct_inputs;
+		int64_t direct_version = 0;
+		int64_t direct_eye_index = -1;
+		int64_t direct_eye_count = 0;
+		if (!get_integer(direct_dictionary, "version", direct_version) || !fits_i32(direct_version) ||
+				!get_string(direct_dictionary, "source_hash", direct.source_hash) ||
+				!get_string(direct_dictionary, "integration_hash", direct.integration_hash) ||
+				!get_integer(direct_dictionary, "eye_index", direct_eye_index) || !fits_i32(direct_eye_index) ||
+				!get_integer(direct_dictionary, "eye_count", direct_eye_count) || !fits_i32(direct_eye_count) ||
+				!get_integer(direct_dictionary, "allocation_generation", direct.allocation_generation) ||
+				!get_integer(direct_dictionary, "frame_generation", direct.frame_generation) ||
+				!get_integer(direct_dictionary, "weather_generation", direct.weather_generation) ||
+				!get_integer(direct_dictionary, "lighting_generation", direct.lighting_generation) ||
+				!get_rid(direct_dictionary, "settings_buffer", direct.settings_buffer) ||
+				!get_rid(direct_dictionary, "weather_pages_buffer", direct.weather_pages_buffer)) {
+			return reject("CloudDirectInputs is missing version, hash, eye/generation identity or typed SSBO RIDs.");
+		}
+		direct.version = (int32_t)direct_version;
+		direct.eye_index = (int32_t)direct_eye_index;
+		direct.eye_count = (int32_t)direct_eye_count;
+		if (direct.version != CloudDirectInputs::ABI_VERSION || direct.source_hash.is_empty() || direct.integration_hash.is_empty() ||
+				direct.eye_index != descriptor.eye_index || direct.eye_count != descriptor.eye_count ||
+				direct.allocation_generation != descriptor.allocation_generation || direct.frame_generation != descriptor.frame_generation ||
+				direct.weather_generation != descriptor.weather_generation || direct.lighting_generation != descriptor.lighting_generation) {
+			return reject("CloudDirectInputs version, source hash, eye or generation disagrees with its v2 descriptor.");
+		}
+		if (!rd->storage_buffer_is_valid(direct.settings_buffer) || !rd->storage_buffer_is_valid(direct.weather_pages_buffer) ||
+				rd->storage_buffer_get_size(direct.settings_buffer) != CloudDirectInputs::SETTINGS_BYTES ||
+				rd->storage_buffer_get_size(direct.weather_pages_buffer) != CloudDirectInputs::WEATHER_PAGES_BYTES) {
+			return reject("CloudDirectInputs requires actual 496-byte settings and 1024-byte WeatherPages storage buffers.");
+		}
+		// Audit-only synchronous readback: verify the actual std430 float payload,
+		// not just its RID and byte count. This setter is not a production path.
+		const Vector<uint8_t> settings_bytes = rd->buffer_get_data(direct.settings_buffer);
+		if (settings_bytes.size() != CloudDirectInputs::SETTINGS_BYTES) {
+			return reject("CloudDirectInputs settings readback did not return exactly 496 bytes.");
+		}
+		float settings[CloudDirectInputs::SETTINGS_BYTES / sizeof(float)];
+		memcpy(settings, settings_bytes.ptr(), sizeof(settings));
+		for (float value : settings) {
+			if (!std::isfinite(value)) {
+				return reject("CloudDirectInputs settings payload contains a non-finite std430 float.");
+			}
+		}
+		const uint64_t eye_layer_offset = (uint64_t)descriptor.eye_index * (uint64_t)descriptor.candidate_layers;
+		if (settings[52] != descriptor.trace_size.x || settings[53] != descriptor.trace_size.y ||
+				settings[54] != descriptor.candidate_layers || settings[55] != (float)eye_layer_offset ||
+				(uint64_t)settings[55] != eye_layer_offset ||
+				settings[35] <= 0.0f || settings[56] <= 0.0f || settings[59] <= 0.0f) {
+			return reject("CloudDirectInputs actual settings payload disagrees with trace dimensions, eye offset, physical radius or full-ray schedule.");
+		}
+		// Only finite values and a few descriptor-linked header fields are
+		// checked here; physical observer/schedule semantics remain unproven.
+		direct.settings_header_fields_checked = true;
+		struct DirectTextureField {
+			const char *name;
+			RD::TextureType type;
+			CloudDirectTextureInput *input;
+		};
+		const DirectTextureField direct_textures[] = {
+			{ "climate_moisture", RD::TEXTURE_TYPE_2D, &direct.climate_moisture },
+			{ "base_noise", RD::TEXTURE_TYPE_3D, &direct.base_noise },
+			{ "detail_noise", RD::TEXTURE_TYPE_3D, &direct.detail_noise },
+			{ "shape_noise", RD::TEXTURE_TYPE_3D, &direct.shape_noise },
+			{ "local_fog", RD::TEXTURE_TYPE_3D, &direct.local_fog },
+			{ "scene_depth", RD::TEXTURE_TYPE_2D, &direct.scene_depth },
+			{ "weather", RD::TEXTURE_TYPE_3D, &direct.weather },
+			{ "terrain_sun_global", RD::TEXTURE_TYPE_3D, &direct.terrain_sun_global },
+			{ "terrain_sun_local", RD::TEXTURE_TYPE_3D, &direct.terrain_sun_local },
+			{ "solar_current", RD::TEXTURE_TYPE_3D, &direct.solar_current },
+			{ "solar_previous", RD::TEXTURE_TYPE_3D, &direct.solar_previous },
+			{ "atmosphere_optical_depth", RD::TEXTURE_TYPE_2D, &direct.atmosphere_optical_depth },
+		};
+		for (const DirectTextureField &field : direct_textures) {
+			const Variant field_value = direct_dictionary.get(StringName(field.name), Variant());
+			if (field_value.get_type() != Variant::DICTIONARY) {
+				return reject(vformat("CloudDirectInputs texture '%s' is missing typed allocation metadata.", field.name));
+			}
+			const Dictionary field_dictionary = field_value;
+			int64_t declared_format = -1;
+			int64_t declared_mipmaps = 0;
+			if (!get_rid(field_dictionary, "rid", field.input->rid) || !get_integer(field_dictionary, "format", declared_format) ||
+					!get_extent(field_dictionary, "extent", field.input->extent) || !get_integer(field_dictionary, "mipmaps", declared_mipmaps) ||
+					declared_format < 0 || declared_format >= RD::DATA_FORMAT_MAX || declared_mipmaps < 1 || !fits_i32(declared_mipmaps) ||
+					field.input->extent.x <= 0 || field.input->extent.y <= 0 || field.input->extent.z <= 0 ||
+					(field.type == RD::TEXTURE_TYPE_2D && field.input->extent.z != 1) || !rd->texture_is_valid(field.input->rid)) {
+				return reject(vformat("CloudDirectInputs texture '%s' has invalid RID, format, extent or mip metadata.", field.name));
+			}
+			const RD::TextureStorageOverlap lt_overlap = rd->texture_storage_overlap(field.input->rid, descriptor.lt_texture);
+			const RD::TextureStorageOverlap depth_overlap = rd->texture_storage_overlap(field.input->rid, descriptor.depth_texture);
+			if (lt_overlap != RD::TEXTURE_STORAGE_OVERLAP_DISJOINT || depth_overlap != RD::TEXTURE_STORAGE_OVERLAP_DISJOINT) {
+				const bool proven_overlap = lt_overlap == RD::TEXTURE_STORAGE_OVERLAP_OVERLAP || depth_overlap == RD::TEXTURE_STORAGE_OVERLAP_OVERLAP;
+				return reject(vformat("CloudDirectInputs sampled texture '%s' %s a writable current L/T or depth output storage view.", field.name,
+						proven_overlap ? "aliases" : "has unknown separation from"));
+			}
+			field.input->declared_format = (RD::DataFormat)declared_format;
+			field.input->mipmaps = (int32_t)declared_mipmaps;
+			const RD::TextureFormat actual = rd->texture_get_format(field.input->rid);
+			if (actual.format != field.input->declared_format || actual.texture_type != field.type ||
+					actual.width != (uint32_t)field.input->extent.x || actual.height != (uint32_t)field.input->extent.y ||
+					actual.depth != (uint32_t)field.input->extent.z || actual.mipmaps != (uint32_t)field.input->mipmaps ||
+					actual.array_layers != 1 || actual.samples != RD::TEXTURE_SAMPLES_1 ||
+					(actual.usage_bits & RD::TEXTURE_USAGE_SAMPLING_BIT) == 0) {
+				return reject(vformat("CloudDirectInputs texture '%s' disagrees with the actual RD format, extent, type, mips, samples or sampling usage.", field.name));
+			}
+			if ((field.input == &direct.weather && actual.format != RD::DATA_FORMAT_R16G16_SFLOAT) ||
+					((field.input == &direct.solar_current || field.input == &direct.solar_previous) && actual.format != RD::DATA_FORMAT_R16_SFLOAT)) {
+				return reject(vformat("CloudDirectInputs texture '%s' violates the pinned producer's known volume format.", field.name));
+			}
+		}
+		if (direct.scene_depth.extent.x != descriptor.output_size.x || direct.scene_depth.extent.y != descriptor.output_size.y) {
+			return reject("CloudDirectInputs raw scene depth extent disagrees with the render output size.");
+		}
+		for (uint32_t previous_eye = 0; previous_eye < eye; previous_eye++) {
+			const CloudDirectInputs &previous = descriptors[previous_eye].direct_inputs;
+			const RD::TextureStorageOverlap depth_overlap = rd->texture_storage_overlap(direct.scene_depth.rid, previous.scene_depth.rid);
+			if (depth_overlap != RD::TEXTURE_STORAGE_OVERLAP_DISJOINT) {
+				return reject(depth_overlap == RD::TEXTURE_STORAGE_OVERLAP_OVERLAP ?
+						"CloudDirectInputs scene-depth storage views overlap across eyes." :
+						"CloudDirectInputs scene-depth storage separation across eyes is unknown.");
+			}
+			if (direct.settings_buffer == previous.settings_buffer || direct.source_hash != previous.source_hash ||
+					direct.integration_hash != previous.integration_hash) {
+				return reject("CloudDirectInputs must use a distinct settings SSBO per eye and one matching source/integration hash.");
+			}
+		}
+		direct.allocations_validated = true;
+		// RD does not expose sampler bindings or prove that metadata hashes match
+		// the native integration source. Per-eye scene-depth generation identity
+		// and an owner-backed GPU-use lease are also absent.
+		// Keep receiver_compatible false even after every allocation check passes.
+		const uint64_t view_depth = (uint64_t)descriptor.slot_capacity * descriptor.eye_count;
+		uint64_t ray_count = 0;
+		uint64_t ray_map_bytes = 0;
+		uint64_t pool_nodes = 0;
+		uint64_t pool_lt_bytes = 0;
+		uint64_t pool_depth_bytes = 0;
+		const bool buffer_sizes_representable = multiply_size((uint64_t)descriptor.trace_size.x, (uint64_t)descriptor.trace_size.y, ray_count) &&
+			multiply_size(ray_count, descriptor.eye_count, ray_count) && multiply_size(ray_count, sizeof(uint32_t), ray_map_bytes) &&
+			multiply_size((uint64_t)descriptor.pool_capacity, descriptor.candidate_layers, pool_nodes) &&
+			multiply_size(pool_nodes, 2 * sizeof(uint32_t), pool_lt_bytes) && multiply_size(pool_nodes, sizeof(float), pool_depth_bytes) &&
+			view_depth <= UINT32_MAX && ray_map_bytes <= UINT32_MAX && pool_lt_bytes <= UINT32_MAX && pool_depth_bytes <= UINT32_MAX;
+		const bool pool_valid = descriptor.pool_capacity == 0 ?
+			(!descriptor.exception_lt_pool.is_valid() && !descriptor.exception_depth_pool.is_valid()) :
+			(rd->storage_buffer_is_valid(descriptor.exception_lt_pool) && rd->storage_buffer_is_valid(descriptor.exception_depth_pool));
+		if (!buffer_sizes_representable ||
+				!texture_matches(descriptor.lt_texture, RD::DATA_FORMAT_R16G16B16A16_SFLOAT, descriptor.trace_size.x, descriptor.trace_size.y, (uint32_t)view_depth) ||
+				!texture_matches(descriptor.depth_texture, RD::DATA_FORMAT_R32_SFLOAT, descriptor.trace_size.x, descriptor.trace_size.y, (uint32_t)view_depth) ||
+				!rd->storage_buffer_is_valid(descriptor.ray_map) || rd->storage_buffer_get_size(descriptor.ray_map) < ray_map_bytes ||
+				!pool_valid || (descriptor.pool_capacity > 0 &&
+					(rd->storage_buffer_get_size(descriptor.exception_lt_pool) < pool_lt_bytes || rd->storage_buffer_get_size(descriptor.exception_depth_pool) < pool_depth_bytes))) {
+			return reject("Compact cloud-medium v2 resource RID failed texture format/extent/usage or pool-capacity validation.");
+		}
+
+		if (eye == 0) {
+			common_allocation_generation = descriptor.allocation_generation;
+			common_frame_generation = descriptor.frame_generation;
+			common_weather_generation = descriptor.weather_generation;
+			common_lighting_generation = descriptor.lighting_generation;
+			common_candidate_layers = descriptor.candidate_layers;
+		} else if (descriptor.trace_size != descriptors[0].trace_size || descriptor.output_size != descriptors[0].output_size ||
+				descriptor.candidate_layers != common_candidate_layers || descriptor.lt_texture != descriptors[0].lt_texture || descriptor.depth_texture != descriptors[0].depth_texture ||
+				descriptor.ray_map != descriptors[0].ray_map || descriptor.exception_lt_pool != descriptors[0].exception_lt_pool ||
+				descriptor.exception_depth_pool != descriptors[0].exception_depth_pool || descriptor.pool_capacity != descriptors[0].pool_capacity ||
+				descriptor.allocation_generation != common_allocation_generation || descriptor.frame_generation != common_frame_generation ||
+				descriptor.weather_generation != common_weather_generation || descriptor.lighting_generation != common_lighting_generation) {
+			return reject("Compact cloud-medium v2 publication must contain every eye from the same generation.");
+		}
+		descriptors.write[eye] = descriptor;
+	}
+
+	if (cloud_medium_has_generation) {
+		if (common_allocation_generation < cloud_medium_last_allocation_generation ||
+				(common_allocation_generation == cloud_medium_last_allocation_generation && common_frame_generation < cloud_medium_last_frame_generation) ||
+				(common_allocation_generation == cloud_medium_last_allocation_generation && common_weather_generation < cloud_medium_last_weather_generation) ||
+				(common_allocation_generation == cloud_medium_last_allocation_generation && common_lighting_generation < cloud_medium_last_lighting_generation)) {
+			return reject("Stale compact cloud-medium v2 generation was rejected.");
+		}
+	}
+
+	// Allocation preflight is not an authorization to publish or bind DIRECT.
+	// The native sampler layout, authoritative source hash and GPU-use lease
+	// have no verified implementation. Keep v2 entirely neutral for now.
+	return reject("CloudDirectInputs allocation preflight passed, but native layout/hash/lease verification is absent; v2 publication remains disabled.");
+}
+
+RID RenderSceneBuffersRD::get_local_fog_texture() {
+	if (!has_custom_data(RB_SCOPE_FOG)) { return RID(); }
+	Ref<RendererRD::Fog::VolumetricFog> fog = get_custom_data(RB_SCOPE_FOG);
+	return fog->fog_map;
+}
+
+Vector2 RenderSceneBuffersRD::get_local_fog_range() {
+	if (!has_custom_data(RB_SCOPE_FOG)) { return Vector2(); }
+	Ref<RendererRD::Fog::VolumetricFog> fog = get_custom_data(RB_SCOPE_FOG);
+	return Vector2(fog->length, fog->spread);
+}
+
+Dictionary RenderSceneBuffersRD::get_local_fog_medium_capture() {
+	Dictionary result;
+	result["requested"] = local_fog_medium_capture_requested;
+	result["units_accepted"] = false;
+	result["gpu_completion_verified"] = false;
+	result["production_published"] = false;
+	result["mono_only"] = true;
+	if (!local_fog_medium_capture_requested || !has_custom_data(RB_SCOPE_FOG)) { return result; }
+	Ref<RendererRD::Fog::VolumetricFog> fog = get_custom_data(RB_SCOPE_FOG);
+	if (!fog->local_medium_capture || !fog->local_medium_recorded) { return result; }
+	result["recorded"] = true;
+	result["recorded_frame"] = fog->local_medium_frame;
+	result["payload_bytes"] = uint64_t(fog->width) * fog->height * fog->depth * 64;
+	result["coefficients"] = fog->local_medium_coefficients;
+	result["emission"] = fog->local_medium_emission;
+	result["uncertified_source"] = fog->local_medium_source;
+	result["direct_source_pre_camera"] = fog->local_medium_direct_source;
+	result["direct_camera_normalization"] = fog->local_medium_camera_normalization;
+	result["phase_g"] = fog->local_medium_phase_g;
+	result["physical_light_units"] = fog->local_medium_physical_light_units;
+	result["direct_source_unit_version"] = 1;
+	result["direct_source_includes_cloud_air_attenuation"] = false;
+	result["size"] = Vector3i(fog->width, fog->height, fog->depth);
+	result["camera"] = fog->local_medium_camera;
+	result["projection"] = fog->local_medium_projection;
+	result["range"] = Vector2(fog->length, fog->spread);
+	result["format_version"] = 2;
+	return result;
 }
 
 void RenderSceneBuffersRD::update_sizes(NamedTexture &p_named_texture) {
@@ -125,6 +514,9 @@ void RenderSceneBuffersRD::update_samplers() {
 }
 
 void RenderSceneBuffersRD::cleanup() {
+	// Borrowed cloud resources may not outlive this view-buffer allocation.
+	set_cloud_medium(RID(), 0.0f);
+
 	// Free our data buffers (but don't destroy them)
 	for (KeyValue<StringName, Ref<RenderBufferCustomDataRD>> &E : data_buffers) {
 		E.value->free_data();

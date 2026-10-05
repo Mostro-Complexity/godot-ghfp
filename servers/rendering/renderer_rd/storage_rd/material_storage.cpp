@@ -1242,6 +1242,25 @@ bool MaterialStorage::MaterialData::update_parameters_uniform_set(const HashMap<
 	}
 
 	uniform_set = RD::get_singleton()->uniform_set_create(uniforms, p_shader, p_shader_uniform_set);
+	if (!uniform_set.is_valid() || !RD::get_singleton()->uniform_set_is_valid(uniform_set)) {
+		// Keep the failed set fail-closed. Registering a callback on the null RID
+		// only emits a second error and cannot arrange a later rebuild.
+		int texture_index = 0;
+		for (int i = 0; i < p_texture_uniforms.size(); i++) {
+			const int array_size = p_texture_uniforms[i].array_size > 0 ? p_texture_uniforms[i].array_size : 1;
+			// Match Uniform construction above: a sampler array has one binding
+			// with multiple elements, not one binding per texture RID.
+			const int uniform_binding = 1 + texture_index;
+			for (int j = 0; j < array_size; j++, texture_index++) {
+				const RID texture = texture_cache[texture_index];
+				if (!RD::get_singleton()->texture_is_valid(texture)) {
+					WARN_PRINT(vformat("Material UniformSet creation failed: material RID %s, shader RID %s, texture uniform '%s' binding %d element %d has invalid RID %s.", itos(self.get_id()), itos(p_shader.get_id()), p_texture_uniforms[i].name, uniform_binding, j, itos(texture.get_id())));
+				}
+			}
+		}
+		uniform_set = RID();
+		return true;
+	}
 
 	RD::get_singleton()->uniform_set_set_invalidation_callback(uniform_set, MaterialStorage::_material_uniform_set_erased, &self);
 

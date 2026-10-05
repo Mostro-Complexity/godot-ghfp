@@ -1224,6 +1224,13 @@ RID RendererViewport::viewport_get_render_target(RID p_viewport) const {
 	return viewport->render_target;
 }
 
+RID RendererViewport::viewport_get_camera(RID p_viewport) const {
+	const Viewport *viewport = viewport_owner.get_or_null(p_viewport);
+	ERR_FAIL_NULL_V(viewport, RID());
+
+	return viewport->camera;
+}
+
 RID RendererViewport::viewport_get_texture(RID p_viewport) const {
 	const Viewport *viewport = viewport_owner.get_or_null(p_viewport);
 	ERR_FAIL_NULL_V(viewport, RID());

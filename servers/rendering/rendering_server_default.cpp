@@ -262,7 +262,13 @@ void RenderingServerDefault::_init() {
 void RenderingServerDefault::_finish() {
 	if (test_cube.is_valid()) {
 		free_rid(test_cube);
+		test_cube = RID();
 	}
+
+	// Cached RenderingServer test/white resources must be released while their
+	// renderer storages are still alive. A late get_white_texture() otherwise
+	// survives into TextureStorage/RenderingDevice leak reporting at shutdown.
+	_free_internal_rids();
 
 	RSG::canvas->finalize();
 	memdelete(RSG::canvas);

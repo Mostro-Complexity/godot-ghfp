@@ -31,10 +31,27 @@
 #include "render_data.h"
 
 #include "core/object/class_db.h"
+#include "servers/rendering/storage/camera_attributes_storage.h"
+
+float RenderData::get_camera_exposure_normalization_factor() const {
+	const RID camera_attributes = get_camera_attributes();
+	if (!camera_attributes.is_valid()) {
+		return 1.0;
+	}
+
+	RendererCameraAttributes *storage = RendererCameraAttributes::get_singleton();
+	ERR_FAIL_NULL_V(storage, -1.0);
+	if (!storage->owns_camera_attributes(camera_attributes)) {
+		return -1.0;
+	}
+
+	return storage->camera_attributes_get_exposure_normalization_factor(camera_attributes);
+}
 
 void RenderData::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_render_scene_buffers"), &RenderData::get_render_scene_buffers);
 	ClassDB::bind_method(D_METHOD("get_render_scene_data"), &RenderData::get_render_scene_data);
 	ClassDB::bind_method(D_METHOD("get_environment"), &RenderData::get_environment);
 	ClassDB::bind_method(D_METHOD("get_camera_attributes"), &RenderData::get_camera_attributes);
+	ClassDB::bind_method(D_METHOD("get_camera_exposure_normalization_factor"), &RenderData::get_camera_exposure_normalization_factor);
 }

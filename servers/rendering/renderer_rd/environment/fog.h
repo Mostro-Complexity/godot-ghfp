@@ -183,7 +183,8 @@ private:
 			float temporal_blend;
 
 			float sky_border_size[2];
-			float pad[2];
+			uint32_t capture_local_medium;
+			float direct_camera_normalization;
 
 			float cam_rotation[12];
 			float to_prev_view[16];
@@ -316,6 +317,22 @@ public:
 		RID density_map;
 		RID light_map;
 		RID emissive_map;
+		// Opt-in, pre-history/pre-filter coefficients. Full source units are not
+		// certified: lights, sky, GI and authored emission have different units.
+		RID local_medium_coefficients;
+		RID local_medium_emission;
+		RID local_medium_source;
+		RID local_medium_direct_source;
+		float local_medium_camera_normalization = 1.0f;
+		float local_medium_phase_g = 0.0f;
+		bool local_medium_physical_light_units = false;
+		bool local_medium_capture = false;
+		bool local_medium_active = false;
+		bool local_medium_recorded = false;
+		bool local_medium_history_reset = false;
+		uint64_t local_medium_frame = 0;
+		Transform3D local_medium_camera;
+		Projection local_medium_projection;
 
 		RID fog_uniform_set;
 		RID copy_uniform_set;
@@ -340,6 +357,7 @@ public:
 		bool sync_gi_dependent_sets_validity(bool p_ensure_freed = false);
 
 		void init(const Vector3i &fog_size, RID p_sky_shader);
+		void configure_local_medium_capture(bool p_enabled);
 		~VolumetricFog();
 	};
 
@@ -352,6 +370,8 @@ public:
 		bool is_using_radiance_octmap_array;
 		uint32_t max_cluster_elements;
 		bool volumetric_fog_filter_active;
+		bool capture_local_medium = false;
+		float direct_camera_normalization = 1.0f;
 		RID shadow_sampler;
 		RID voxel_gi_buffer;
 		RID shadow_atlas_depth;

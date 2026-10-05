@@ -40,11 +40,187 @@
 #include "servers/rendering/renderer_rd/uniform_set_cache_rd.h"
 #include "servers/rendering/rendering_device.h"
 #include "servers/rendering/rendering_server_default.h"
+#include "servers/rendering/renderer_viewport.h"
+#include "core/os/os.h"
 #include "servers/rendering/storage/ltc_lut.gen.h"
+
+#include <atomic>
+#include <cstring>
 
 using namespace RendererSceneRenderImplementation;
 
 #define PRELOAD_PIPELINES_ON_SURFACE_CACHE_CONSTRUCTION 1
+
+// Experimental v2 receiver remains disabled until all receiver and producer
+// acceptance gates have passed.
+static constexpr bool CLOUD_MEDIUM_V2_RECEIVER_EXPERIMENTAL_ENABLED = false;
+// TODO: The descriptor currently provides borrowed RIDs, not an owner-backed
+// lease that is guaranteed to survive through every queued GPU consumer. Keep
+// this false until that lifetime contract and generation-status gate exist.
+static constexpr bool CLOUD_MEDIUM_V2_OWNER_GPU_USAGE_LEASE_SUPPORTED = false;
+// Binding 25 is not exposed by the current descriptor/renderer interface.
+static constexpr bool CLOUD_MEDIUM_V2_GENERATION_STATUS_GATE_SUPPORTED = false;
+
+static bool cloud_medium_v2_checked_multiply(uint64_t p_a, uint64_t p_b, uint64_t &r_product) {
+	if (p_b != 0 && p_a > UINT64_MAX / p_b) {
+		return false;
+	}
+	r_product = p_a * p_b;
+	return true;
+}
+
+bool RenderForwardClustered::request_hdr_capture(uint64_t p_id, RID p_viewport, RID p_render_target, RID p_camera, uint64_t p_deadline_msec, const Callable &p_completion) {
+	MutexLock lock(hdr_capture_mutex);
+	if (hdr_capture_pending || p_id == 0 || !p_viewport.is_valid() || !p_render_target.is_valid() || !p_camera.is_valid() || !p_completion.is_valid()) {
+		return false;
+	}
+	hdr_capture_request.id = p_id;
+	hdr_capture_request.viewport = p_viewport;
+	hdr_capture_request.render_target = p_render_target;
+	hdr_capture_request.camera = p_camera;
+	hdr_capture_request.deadline_msec = p_deadline_msec;
+	hdr_capture_request.completion = p_completion;
+	hdr_capture_pending = true;
+	return true;
+}
+
+void RenderForwardClustered::cancel_hdr_capture(uint64_t p_id) {
+	MutexLock lock(hdr_capture_mutex);
+	if (hdr_capture_pending && hdr_capture_request.id == p_id) {
+		hdr_capture_pending = false;
+		hdr_capture_request = HDRCaptureRequest();
+	}
+}
+
+void RenderForwardClustered::_process_hdr_capture(const Ref<RenderSceneBuffersRD> &p_render_buffers) {
+	HDRCaptureRequest request;
+	bool request_ready = false;
+	bool request_expired = false;
+	{
+		MutexLock lock(hdr_capture_mutex);
+		if (!hdr_capture_pending) {
+			return;
+		}
+		if (OS::get_singleton()->get_ticks_msec() >= hdr_capture_request.deadline_msec) {
+			request_expired = true;
+		} else if (p_render_buffers->get_render_target() == hdr_capture_request.render_target) {
+			request_ready = true;
+		} else {
+			return;
+		}
+		request = hdr_capture_request;
+		hdr_capture_request = HDRCaptureRequest();
+		hdr_capture_pending = false;
+	}
+
+	Dictionary metadata;
+	metadata["schema"] = "godot.ai-viewport-hdr-capture/v1";
+	metadata["success"] = false;
+	metadata["potentiallyStalling"] = true;
+	metadata["viewportRid"] = String::num_uint64(request.viewport.get_id());
+	metadata["cameraRid"] = String::num_uint64(request.camera.get_id());
+	metadata["renderTargetRid"] = String::num_uint64(request.render_target.get_id());
+	metadata["renderFrame"] = int64_t(RSG::rasterizer->get_frame_number());
+	metadata["eye"] = 0;
+	metadata["stage"] = "forward_plus.post_transparent_resolved.pre_taa_pre_tonemap";
+	metadata["format"] = "RGBA16F";
+	metadata["channels"] = "RGBA";
+	metadata["rowOrder"] = "texture-y-ascending";
+	metadata["exposureConvention"] = "stored scene-linear RGBA16F; values are not de-pre-exposed; luminanceMultiplier is recorded for interpretation";
+	metadata["luminanceMultiplier"] = p_render_buffers->get_luminance_multiplier();
+
+	PackedByteArray empty_data;
+	if (request_expired) {
+		metadata["error"] = "HDR capture request expired before reaching the target viewport render.";
+		request.completion.call_deferred(empty_data, metadata);
+		return;
+	}
+	if (!request_ready || RSG::viewport->viewport_get_camera(request.viewport) != request.camera) {
+		metadata["error"] = "HDR capture viewport camera changed before the requested frame.";
+		request.completion.call_deferred(empty_data, metadata);
+		return;
+	}
+
+	const Size2i size = p_render_buffers->get_internal_size();
+	metadata["width"] = size.x;
+	metadata["height"] = size.y;
+	if (p_render_buffers->get_view_count() != 1 || size.x <= 0 || size.y <= 0 ||
+			p_render_buffers->get_base_data_format() != RD::DATA_FORMAT_R16G16B16A16_SFLOAT) {
+		metadata["error"] = "HDR capture requires one Forward+ eye and an RGBA16F resolved scene buffer.";
+		request.completion.call_deferred(empty_data, metadata);
+		return;
+	}
+
+	const uint64_t expected_size = uint64_t(size.x) * uint64_t(size.y) * 8u;
+	if (expected_size > uint64_t(INT32_MAX)) {
+		metadata["error"] = "HDR capture exceeds the supported byte-array size.";
+		request.completion.call_deferred(empty_data, metadata);
+		return;
+	}
+
+	const uint64_t start_usec = OS::get_singleton()->get_ticks_usec();
+	RD *rd = RD::get_singleton();
+	RID mirror;
+	RID framebuffer;
+	PackedByteArray pixels;
+	String error;
+
+	RD::TextureFormat mirror_format;
+	mirror_format.format = RD::DATA_FORMAT_R16G16B16A16_SFLOAT;
+	mirror_format.width = size.x;
+	mirror_format.height = size.y;
+	mirror_format.depth = 1;
+	mirror_format.array_layers = 1;
+	mirror_format.mipmaps = 1;
+	mirror_format.texture_type = RD::TEXTURE_TYPE_2D;
+	mirror_format.samples = RD::TEXTURE_SAMPLES_1;
+	mirror_format.usage_bits = RD::TEXTURE_USAGE_COLOR_ATTACHMENT_BIT | RD::TEXTURE_USAGE_CAN_COPY_FROM_BIT;
+
+	mirror = rd->texture_create(mirror_format, RD::TextureView());
+	if (!mirror.is_valid()) {
+		error = "Could not allocate the one-shot RGBA16F readback mirror.";
+	} else {
+		Vector<RID> attachments;
+		attachments.push_back(mirror);
+		framebuffer = rd->framebuffer_create(attachments);
+		if (!framebuffer.is_valid()) {
+			error = "Could not create a framebuffer for the one-shot HDR mirror.";
+		} else {
+			copy_effects->copy_to_fb_rect(p_render_buffers->get_internal_texture(), framebuffer,
+					Rect2i(Point2i(), size), false, false, false, false, RID(), false, false, false, false,
+					Rect2(), 1.0f, false);
+			pixels = rd->texture_get_data(mirror, 0); // Explicit diagnostic stall; never used by the default render path.
+			if (uint64_t(pixels.size()) != expected_size) {
+				error = "HDR mirror readback returned an unexpected byte count.";
+			}
+		}
+	}
+
+	if (framebuffer.is_valid()) {
+		rd->free_rid(framebuffer);
+	}
+	if (mirror.is_valid()) {
+		rd->free_rid(mirror);
+	}
+	metadata["elapsedMicros"] = int64_t(OS::get_singleton()->get_ticks_usec() - start_usec);
+	if (!error.is_empty()) {
+		metadata["error"] = error;
+		pixels.clear();
+	} else {
+		metadata["success"] = true;
+	}
+	request.completion.call_deferred(pixels, metadata);
+}
+
+static void cloud_medium_v2_report_preflight_failure(uint32_t p_failure_bit, const char *p_reason) {
+	// A malformed/published descriptor is actionable, but reporting it every
+	// frame is not. Report the first occurrence of each failure class only.
+	static std::atomic<uint32_t> reported_failures = 0;
+	const uint32_t previous = reported_failures.fetch_or(p_failure_bit, std::memory_order_relaxed);
+	if ((previous & p_failure_bit) == 0) {
+		WARN_PRINT(vformat("Native cloud medium v2 preflight rejected descriptor: %s. Receiver remains disabled.", p_reason));
+	}
+}
 
 #define FADE_ALPHA_PASS_THRESHOLD 0.999
 
@@ -499,6 +675,7 @@ void RenderForwardClustered::_render_list_template(RenderingDevice::DrawListID p
 		RID pipeline_rd;
 		const uint32_t ubershader_iterations = 2;
 		bool pipeline_valid = false;
+		bool shader_changed = false;
 		while (pipeline_key.ubershader < ubershader_iterations) {
 			// Skeleton and blend shape.
 			RD::VertexFormatID vertex_format = -1;
@@ -521,15 +698,17 @@ void RenderForwardClustered::_render_list_template(RenderingDevice::DrawListID p
 			}
 
 			pipeline_hash = pipeline_key.hash();
+			// A shader switch can invalidate descriptor sets even when the next
+			// material happens to reuse the same RID. Keep the renderer's RID cache
+			// from suppressing the rebind required by RenderingDevice's layout rules.
+			shader_changed = shader != prev_shader;
 
-			if (shader != prev_shader || pipeline_hash != prev_pipeline_hash) {
+			if (shader_changed || pipeline_hash != prev_pipeline_hash) {
 				RSE::PipelineSource pipeline_source = pipeline_key.ubershader ? RSE::PIPELINE_SOURCE_DRAW : RSE::PIPELINE_SOURCE_SPECIALIZATION;
 				pipeline_rd = shader->pipeline_hash_map.get_pipeline(pipeline_key, pipeline_hash, pipeline_key.ubershader, pipeline_source);
 
 				if (pipeline_rd.is_valid()) {
 					pipeline_valid = true;
-					prev_shader = shader;
-					prev_pipeline_hash = pipeline_hash;
 					break;
 				} else {
 					pipeline_key.ubershader++;
@@ -539,6 +718,24 @@ void RenderForwardClustered::_render_list_template(RenderingDevice::DrawListID p
 				pipeline_valid = true;
 				break;
 			}
+		}
+
+		const bool material_set_required = shader->ubo_size > 0 || !shader->texture_uniforms.is_empty();
+		const bool material_set_valid = material_uniform_set.is_valid() && RD::get_singleton()->uniform_set_is_valid(material_uniform_set);
+		if (pipeline_valid && material_set_required && !material_set_valid) {
+			// A failed material UniformSet must never inherit the previous draw's
+			// set 3. Skip this surface until its descriptor set can be rebuilt.
+			prev_material_uniform_set = RID();
+			// Do not let a skipped pipeline selection become the renderer's cache
+			// state. Force the next valid surface to bind its actual pipeline.
+			prev_shader = nullptr;
+			prev_pipeline_hash = 0;
+			static std::atomic_flag reported_missing_material_set = ATOMIC_FLAG_INIT;
+			if (!reported_missing_material_set.test_and_set(std::memory_order_relaxed)) {
+				const uint32_t material_id = (uint32_t(surf->sort.material_id_hi) << 24) | uint32_t(surf->sort.material_id_lo);
+				WARN_PRINT(vformat("Skipping Forward+ surface with required but invalid material set 3 (material ID %s, shader RID %s).", itos(material_id), itos(shader->version.get_id())));
+			}
+			pipeline_valid = false;
 		}
 
 		if (pipeline_valid) {
@@ -562,6 +759,9 @@ void RenderForwardClustered::_render_list_template(RenderingDevice::DrawListID p
 
 			if (!pipeline_rd.is_null()) {
 				RD::get_singleton()->draw_list_bind_render_pipeline(draw_list, pipeline_rd);
+				// Cache only a pipeline that was actually submitted to the draw list.
+				prev_shader = shader;
+				prev_pipeline_hash = pipeline_hash;
 			}
 
 			if (xforms_uniform_set.is_valid() && prev_xforms_uniform_set != xforms_uniform_set) {
@@ -569,7 +769,7 @@ void RenderForwardClustered::_render_list_template(RenderingDevice::DrawListID p
 				prev_xforms_uniform_set = xforms_uniform_set;
 			}
 
-			if (material_uniform_set != prev_material_uniform_set) {
+			if (shader_changed || material_uniform_set != prev_material_uniform_set) {
 				// Update uniform set.
 				if (material_uniform_set.is_valid() && RD::get_singleton()->uniform_set_is_valid(material_uniform_set)) { // Material may not have a uniform set.
 					RD::get_singleton()->draw_list_bind_uniform_set(draw_list, material_uniform_set, MATERIAL_UNIFORM_SET);
@@ -710,6 +910,11 @@ uint32_t RenderForwardClustered::_setup_environment(const RenderDataRD *p_render
 			scene_state.uniform_buffers[i] = p_render_data->scene_data->create_uniform_buffer();
 		}
 	}
+	if (uniform_buffer_index >= scene_state.cloud_medium_v2_binding_snapshots.size()) {
+		scene_state.cloud_medium_v2_binding_snapshots.resize(uniform_buffer_index + 1);
+	}
+	SceneState::CloudMediumV2BindingSnapshot &cloud_medium_v2_snapshot = scene_state.cloud_medium_v2_binding_snapshots[uniform_buffer_index];
+	cloud_medium_v2_snapshot = SceneState::CloudMediumV2BindingSnapshot();
 
 	float luminance_multiplier = rd.is_valid() ? rd->get_luminance_multiplier() : 1.0;
 
@@ -728,6 +933,11 @@ uint32_t RenderForwardClustered::_setup_environment(const RenderDataRD *p_render
 
 	scene_state.ubo.gi_upscale_for_msaa = false;
 	scene_state.ubo.volumetric_fog_enabled = false;
+	scene_state.ubo.volumetric_fog_pad = 0;
+	memset(scene_state.ubo.cloud_medium_v2, 0, sizeof(scene_state.ubo.cloud_medium_v2));
+	memset(scene_state.ubo.cloud_medium_v2_pool, 0, sizeof(scene_state.ubo.cloud_medium_v2_pool));
+	memset(scene_state.ubo.cloud_medium_v2_status, 0, sizeof(scene_state.ubo.cloud_medium_v2_status));
+	memset(scene_state.ubo.cloud_medium_v2_validation, 0, sizeof(scene_state.ubo.cloud_medium_v2_validation));
 
 	if (rd.is_valid()) {
 		if (rd->get_msaa_3d() != RSE::VIEWPORT_MSAA_DISABLED) {
@@ -754,6 +964,122 @@ uint32_t RenderForwardClustered::_setup_environment(const RenderDataRD *p_render
 		}
 	}
 
+	if (rd.is_valid() && rd->cloud_medium.is_valid()) {
+		scene_state.ubo.volumetric_fog_enabled = true;
+		scene_state.ubo.volumetric_fog_pad = rd->get_view_count();
+		scene_state.ubo.volumetric_fog_inv_length = 1.0f / MAX(rd->cloud_medium_far, 1.0f);
+	}
+	if (rd.is_valid() && !p_render_data->reflection_probe.is_valid() && !rd->cloud_medium_compact.is_empty()) {
+		// Validate one immutable result for this implementation-UBO index. The
+		// matching UniformSet consumes only this snapshot and never re-reads RIDs.
+		const uint32_t view_count = rd->get_view_count();
+		const bool descriptors_match_views = view_count > 0 && rd->cloud_medium_compact.size() == (int)view_count;
+		if (!descriptors_match_views) {
+			cloud_medium_v2_report_preflight_failure(1u << 0, "descriptor count does not match the active view count");
+		} else {
+			const RenderSceneBuffersRD::CloudMediumCompactDescriptor &descriptor = rd->cloud_medium_compact[0];
+			uint64_t ray_count_xy = 0;
+			uint64_t ray_count = 0;
+			uint64_t pool_nodes = 0;
+			uint64_t ray_bytes = 0;
+			uint64_t pool_lt_bytes = 0;
+			uint64_t pool_depth_bytes = 0;
+			const bool counts_valid = descriptor.trace_size.x > 0 && descriptor.trace_size.y > 0 && descriptor.eye_count > 0 && descriptor.pool_capacity > 0 &&
+					cloud_medium_v2_checked_multiply((uint64_t)descriptor.trace_size.x, (uint64_t)descriptor.trace_size.y, ray_count_xy) &&
+					cloud_medium_v2_checked_multiply(ray_count_xy, (uint64_t)descriptor.eye_count, ray_count) &&
+					cloud_medium_v2_checked_multiply((uint64_t)descriptor.pool_capacity, 96u, pool_nodes) &&
+					cloud_medium_v2_checked_multiply(ray_count, 4u, ray_bytes) &&
+					cloud_medium_v2_checked_multiply(pool_nodes, 8u, pool_lt_bytes) &&
+					cloud_medium_v2_checked_multiply(pool_nodes, 4u, pool_depth_bytes) &&
+					ray_bytes <= UINT32_MAX && pool_lt_bytes <= UINT32_MAX && pool_depth_bytes <= UINT32_MAX;
+			if (!counts_valid) {
+				cloud_medium_v2_report_preflight_failure(1u << 1, "trace/pool dimensions are non-positive or required byte-size multiplication overflowed");
+			}
+			const bool descriptor_layout_valid = descriptor.format_version == 2 && descriptor.eye_count == (int32_t)view_count &&
+					descriptor.slot_capacity == 24 && descriptor.candidate_layers == 96 && descriptor.pool_capacity >= 1;
+			if (!descriptor_layout_valid) {
+				cloud_medium_v2_report_preflight_failure(1u << 2, "unsupported ABI version, eye count, compact slot count, or pool layout");
+			}
+			bool eyes_match = descriptors_match_views;
+			for (uint32_t eye = 0; eyes_match && eye < view_count; eye++) {
+				const RenderSceneBuffersRD::CloudMediumCompactDescriptor &eye_descriptor = rd->cloud_medium_compact[eye];
+				eyes_match = eye_descriptor.eye_index == (int32_t)eye && eye_descriptor.eye_count == descriptor.eye_count &&
+						eye_descriptor.trace_size == descriptor.trace_size && eye_descriptor.output_size == descriptor.output_size &&
+						eye_descriptor.format_version == descriptor.format_version && eye_descriptor.slot_capacity == descriptor.slot_capacity &&
+						eye_descriptor.candidate_layers == descriptor.candidate_layers && eye_descriptor.pool_capacity == descriptor.pool_capacity &&
+						eye_descriptor.lt_texture == descriptor.lt_texture && eye_descriptor.depth_texture == descriptor.depth_texture &&
+						eye_descriptor.ray_map == descriptor.ray_map && eye_descriptor.exception_lt_pool == descriptor.exception_lt_pool &&
+						eye_descriptor.exception_depth_pool == descriptor.exception_depth_pool &&
+						eye_descriptor.allocation_generation == descriptor.allocation_generation && eye_descriptor.frame_generation == descriptor.frame_generation &&
+						eye_descriptor.weather_generation == descriptor.weather_generation && eye_descriptor.lighting_generation == descriptor.lighting_generation;
+			}
+			if (!eyes_match) {
+				cloud_medium_v2_report_preflight_failure(1u << 3, "per-eye descriptors disagree on eye index, dimensions, resources, or generation");
+			}
+			RD *device = RD::get_singleton();
+			bool resources_valid = device != nullptr && counts_valid && eyes_match && descriptor_layout_valid;
+			const bool resource_rids_valid = resources_valid && device->texture_is_valid(descriptor.lt_texture) &&
+					device->texture_is_valid(descriptor.depth_texture) && device->storage_buffer_is_valid(descriptor.ray_map) &&
+					device->storage_buffer_is_valid(descriptor.exception_lt_pool) && device->storage_buffer_is_valid(descriptor.exception_depth_pool);
+			if (resources_valid && !resource_rids_valid) {
+				cloud_medium_v2_report_preflight_failure(1u << 4, "one or more texture/storage-buffer RIDs are invalid");
+			}
+			resources_valid = resource_rids_valid;
+			if (resources_valid) {
+				const RD::TextureFormat lt_format = device->texture_get_format(descriptor.lt_texture);
+				const RD::TextureFormat depth_format = device->texture_get_format(descriptor.depth_texture);
+				uint64_t texture_depth = 0;
+				const bool texture_depth_valid = cloud_medium_v2_checked_multiply((uint64_t)descriptor.slot_capacity, (uint64_t)view_count, texture_depth) && texture_depth <= UINT32_MAX;
+				const uint32_t required_texture_usage = RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT;
+				const bool texture_layout_valid = texture_depth_valid &&
+						lt_format.format == RD::DATA_FORMAT_R16G16B16A16_SFLOAT && depth_format.format == RD::DATA_FORMAT_R32_SFLOAT &&
+						lt_format.texture_type == RD::TEXTURE_TYPE_3D && depth_format.texture_type == RD::TEXTURE_TYPE_3D &&
+						lt_format.width == (uint32_t)descriptor.trace_size.x && depth_format.width == (uint32_t)descriptor.trace_size.x &&
+						lt_format.height == (uint32_t)descriptor.trace_size.y && depth_format.height == (uint32_t)descriptor.trace_size.y &&
+						lt_format.depth == texture_depth && depth_format.depth == texture_depth &&
+						(lt_format.usage_bits & required_texture_usage) == required_texture_usage &&
+						(depth_format.usage_bits & required_texture_usage) == required_texture_usage;
+				if (!texture_layout_valid) {
+					cloud_medium_v2_report_preflight_failure(1u << 5, "L/T or depth texture format, 3D dimensions, or sampling/storage usage is incompatible");
+				}
+				const bool buffer_sizes_valid = device->storage_buffer_get_size(descriptor.ray_map) >= ray_bytes &&
+						device->storage_buffer_get_size(descriptor.exception_lt_pool) >= pool_lt_bytes &&
+						device->storage_buffer_get_size(descriptor.exception_depth_pool) >= pool_depth_bytes;
+				if (!buffer_sizes_valid) {
+					cloud_medium_v2_report_preflight_failure(1u << 6, "ray-map or exception-pool storage buffer is smaller than the checked ABI size");
+				}
+				resources_valid = texture_layout_valid && buffer_sizes_valid;
+			}
+			cloud_medium_v2_snapshot.descriptor_validated = resources_valid;
+			// No generation-status consumer or owner-backed GPU usage lease is
+			// available yet. Never copy borrowed RIDs into the snapshot or bind them.
+			cloud_medium_v2_snapshot.binding_enabled = CLOUD_MEDIUM_V2_RECEIVER_EXPERIMENTAL_ENABLED &&
+					CLOUD_MEDIUM_V2_OWNER_GPU_USAGE_LEASE_SUPPORTED && CLOUD_MEDIUM_V2_GENERATION_STATUS_GATE_SUPPORTED && resources_valid;
+			if (cloud_medium_v2_snapshot.binding_enabled) {
+				cloud_medium_v2_snapshot.lt_texture = descriptor.lt_texture;
+				cloud_medium_v2_snapshot.depth_texture = descriptor.depth_texture;
+				cloud_medium_v2_snapshot.ray_map = descriptor.ray_map;
+				cloud_medium_v2_snapshot.exception_lt_pool = descriptor.exception_lt_pool;
+				cloud_medium_v2_snapshot.exception_depth_pool = descriptor.exception_depth_pool;
+				scene_state.ubo.volumetric_fog_enabled = true;
+				scene_state.ubo.cloud_medium_v2[0] = 1;
+				scene_state.ubo.cloud_medium_v2[1] = (uint32_t)descriptor.trace_size.x;
+				scene_state.ubo.cloud_medium_v2[2] = (uint32_t)descriptor.trace_size.y;
+				scene_state.ubo.cloud_medium_v2[3] = (uint32_t)descriptor.slot_capacity;
+				scene_state.ubo.cloud_medium_v2_pool[0] = (uint32_t)descriptor.candidate_layers;
+				scene_state.ubo.cloud_medium_v2_pool[1] = (uint32_t)descriptor.pool_capacity;
+				scene_state.ubo.cloud_medium_v2_pool[2] = (uint32_t)descriptor.eye_count;
+				scene_state.ubo.cloud_medium_v2_pool[3] = (uint32_t)descriptor.format_version;
+			}
+		}
+	}
+	Vector3 contact_direction;
+	bool contact_enabled = rd.is_valid() && rd->directional_contact_shadow.is_valid();
+	if (contact_enabled) { contact_direction = rd->directional_contact_shadow_direction; }
+	scene_state.ubo.directional_contact_shadow[0] = contact_direction.x;
+	scene_state.ubo.directional_contact_shadow[1] = contact_direction.y;
+	scene_state.ubo.directional_contact_shadow[2] = contact_direction.z;
+	scene_state.ubo.directional_contact_shadow[3] = contact_enabled ? 1.0f : 0.0f;
 	if (get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_UNSHADED) {
 		scene_state.ubo.ss_effects_flags = 0;
 	} else if (p_render_data->reflection_probe.is_null() && is_environment(p_render_data->environment)) {
@@ -1318,7 +1644,7 @@ void RenderForwardClustered::_debug_draw_cluster(Ref<RenderSceneBuffersRD> p_ren
 ////////////////////////////////////////////////////////////////////////////////
 // FOG SHADER
 
-void RenderForwardClustered::_update_volumetric_fog(Ref<RenderSceneBuffersRD> p_render_buffers, RID p_environment, const Projection &p_cam_projection, const Transform3D &p_cam_transform, const Transform3D &p_prev_cam_inv_transform, RID p_shadow_atlas, int p_directional_light_count, bool p_use_directional_shadows, int p_positional_light_count, int p_voxel_gi_count, const PagedArray<RID> &p_fog_volumes) {
+void RenderForwardClustered::_update_volumetric_fog(Ref<RenderSceneBuffersRD> p_render_buffers, RID p_environment, const Projection &p_cam_projection, const Transform3D &p_cam_transform, const Transform3D &p_prev_cam_inv_transform, RID p_shadow_atlas, int p_directional_light_count, bool p_use_directional_shadows, int p_positional_light_count, int p_voxel_gi_count, const PagedArray<RID> &p_fog_volumes, RID p_camera_attributes) {
 	ERR_FAIL_COND(p_render_buffers.is_null());
 
 	Ref<RenderBufferDataForwardClustered> rb_data = p_render_buffers->get_custom_data(RB_SCOPE_FORWARD_CLUSTERED);
@@ -1369,6 +1695,13 @@ void RenderForwardClustered::_update_volumetric_fog(Ref<RenderSceneBuffersRD> p_
 		settings.is_using_radiance_octmap_array = is_using_radiance_octmap_array();
 		settings.max_cluster_elements = RendererRD::LightStorage::get_singleton()->get_max_cluster_elements();
 		settings.volumetric_fog_filter_active = get_volumetric_fog_filter_active();
+		// This first diagnostic ABI describes one camera grid, not stereo or a
+		// reflection's independent lighting field. Never advertise it as per-eye.
+		settings.capture_local_medium = p_render_buffers->local_fog_medium_capture_requested && p_render_buffers->get_view_count() == 1;
+		// Match LightStorage's actual current-render normalization. This scalar
+		// does not normalize authored emission, ambient, sky textures or GI.
+		settings.direct_camera_normalization = p_camera_attributes.is_valid() ?
+				RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_camera_attributes) : 1.0f;
 
 		settings.shadow_sampler = shadow_sampler;
 		settings.shadow_atlas_depth = RendererRD::LightStorage::get_singleton()->owns_shadow_atlas(p_shadow_atlas) ? RendererRD::LightStorage::get_singleton()->shadow_atlas_get_texture(p_shadow_atlas) : RID();
@@ -1681,7 +2014,7 @@ void RenderForwardClustered::_pre_opaque_render(RenderDataRD *p_render_data, boo
 	if (rb_data.is_valid()) {
 		RENDER_TIMESTAMP("Update Volumetric Fog");
 		bool directional_shadows = RendererRD::LightStorage::get_singleton()->has_directional_shadows(directional_light_count);
-		_update_volumetric_fog(rb, p_render_data->environment, p_render_data->scene_data->cam_projection, p_render_data->scene_data->cam_transform, p_render_data->scene_data->prev_cam_transform.affine_inverse(), p_render_data->shadow_atlas, directional_light_count, directional_shadows, positional_light_count, p_render_data->voxel_gi_count, *p_render_data->fog_volumes);
+		_update_volumetric_fog(rb, p_render_data->environment, p_render_data->scene_data->cam_projection, p_render_data->scene_data->cam_transform, p_render_data->scene_data->prev_cam_transform.affine_inverse(), p_render_data->shadow_atlas, directional_light_count, directional_shadows, positional_light_count, p_render_data->voxel_gi_count, *p_render_data->fog_volumes, p_render_data->camera_attributes);
 	}
 }
 
@@ -1714,6 +2047,8 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 
 	Ref<RenderSceneBuffersRD> rb = p_render_data->render_buffers;
 	ERR_FAIL_COND(rb.is_null());
+	rb->set_cloud_medium(RID(), 0.0f);
+	rb->set_directional_contact_shadow(RID(), Vector3());
 	Ref<RenderBufferDataForwardClustered> rb_data;
 	if (rb->has_custom_data(RB_SCOPE_FORWARD_CLUSTERED)) {
 		// Our forward clustered custom data buffer will only be available when we're rendering our normal view.
@@ -2173,8 +2508,6 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 			WARN_PRINT_ONCE("Pre opaque rendering effects can't access resolved depth buffers.");
 		}
 
-		RENDER_TIMESTAMP("Process Pre Opaque Compositor Effects");
-		_process_compositor_effects(RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_PRE_OPAQUE, p_render_data);
 	}
 
 	RID normal_roughness_views[RendererSceneRender::MAX_RENDER_VIEWS];
@@ -2184,6 +2517,15 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		}
 	}
 	_pre_opaque_render(p_render_data, using_ssao, using_ssil, using_ssr, using_sdfgi || using_voxelgi, normal_roughness_views, rb_data.is_valid() && rb_data->has_voxelgi() ? rb_data->get_voxelgi() : RID());
+	// Participating media consume this frame's resolved depth and local fog, before
+	// any opaque/transparent color writes. MSAA therefore never resolves over their result.
+	if (rb.is_valid()) {
+		rb->set_cloud_medium(RID(), 0.0f);
+		rb->set_directional_contact_shadow(RID(), Vector3());
+	}
+	RENDER_TIMESTAMP("Process Pre Opaque Compositor Effects");
+	_process_compositor_effects(RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_PRE_OPAQUE, p_render_data);
+	if (rb.is_valid()) { sky.update_cloud_medium(rb); }
 
 	if (current_cluster_builder) {
 		base_specialization.cluster_has_area_light = current_cluster_builder->get_cluster_count_by_type(ClusterBuilderRD::ELEMENT_TYPE_AREA_LIGHT) != 0;
@@ -2466,6 +2808,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		RENDER_TIMESTAMP("Process Post Transparent Compositor Effects");
 		_process_compositor_effects(RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_POST_TRANSPARENT, p_render_data);
 	}
+	_process_hdr_capture(rb);
 
 	if (rb_data.is_valid() && (using_upscaling || using_taa)) {
 		if (scale_type == SCALE_FSR2) {
@@ -3404,6 +3747,11 @@ RID RenderForwardClustered::_setup_render_pass_uniform_set(RenderListType p_rend
 			rb_data = rb->get_custom_data(RB_SCOPE_FORWARD_CLUSTERED);
 		}
 	}
+	const SceneState::CloudMediumV2BindingSnapshot *cloud_medium_v2_snapshot =
+			p_uniform_buffer_index < scene_state.cloud_medium_v2_binding_snapshots.size() ?
+			&scene_state.cloud_medium_v2_binding_snapshots[p_uniform_buffer_index] : nullptr;
+	const bool use_cloud_medium_v2 = cloud_medium_v2_snapshot != nullptr && cloud_medium_v2_snapshot->descriptor_validated &&
+			cloud_medium_v2_snapshot->binding_enabled;
 
 	//default render buffer and scene state uniform set
 
@@ -3726,6 +4074,11 @@ RID RenderForwardClustered::_setup_render_pass_uniform_set(RenderListType p_rend
 		} else {
 			vfog = texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_3D_WHITE);
 		}
+		if (use_cloud_medium_v2) {
+			vfog = cloud_medium_v2_snapshot->lt_texture;
+		} else if (rb.is_valid() && rb->cloud_medium.is_valid()) {
+			vfog = rb->cloud_medium;
+		}
 		u.append_id(vfog);
 		uniforms.push_back(u);
 	}
@@ -3771,6 +4124,51 @@ RID RenderForwardClustered::_setup_render_pass_uniform_set(RenderListType p_rend
 		uniforms.push_back(u);
 	}
 
+	{
+		RD::Uniform u;
+		u.binding = 37;
+		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
+		RID depth = use_cloud_medium_v2 ? cloud_medium_v2_snapshot->depth_texture : (rb.is_valid() ? rb->cloud_medium_depth : RID());
+		u.append_id(depth.is_valid() ? depth : texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_3D_BLACK));
+		uniforms.push_back(u);
+	}
+	{
+		RD::Uniform u;
+		u.binding = 38;
+		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
+		RID contact = rb.is_valid() ? rb->directional_contact_shadow : RID();
+		u.append_id(contact.is_valid() ? contact : texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_2D_ARRAY_BLACK));
+		uniforms.push_back(u);
+	}
+	{
+		RD::Uniform u;
+		u.binding = 39;
+		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
+		RID moments = rb.is_valid() ? rb->cloud_medium_moments : RID();
+		u.append_id(moments.is_valid() ? moments : texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_3D_BLACK));
+		uniforms.push_back(u);
+	}
+	{
+		RD::Uniform u;
+		u.binding = 40;
+		u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+		u.append_id(use_cloud_medium_v2 ? cloud_medium_v2_snapshot->ray_map : scene_shader.default_vec4_xform_buffer);
+		uniforms.push_back(u);
+	}
+	{
+		RD::Uniform u;
+		u.binding = 41;
+		u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+		u.append_id(use_cloud_medium_v2 ? cloud_medium_v2_snapshot->exception_lt_pool : scene_shader.default_vec4_xform_buffer);
+		uniforms.push_back(u);
+	}
+	{
+		RD::Uniform u;
+		u.binding = 42;
+		u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+		u.append_id(use_cloud_medium_v2 ? cloud_medium_v2_snapshot->exception_depth_pool : scene_shader.default_vec4_xform_buffer);
+		uniforms.push_back(u);
+	}
 	return UniformSetCacheRD::get_singleton()->get_cache_vec(scene_shader.default_shader_rd, RENDER_PASS_UNIFORM_SET, uniforms);
 }
 

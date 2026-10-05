@@ -31,6 +31,7 @@
 #pragma once
 
 #include "core/templates/hash_map.h"
+#include "core/variant/typed_array.h"
 #include "servers/rendering/renderer_rd/effects/vrs.h"
 #include "servers/rendering/renderer_rd/storage_rd/material_storage.h"
 #include "servers/rendering/renderer_rd/storage_rd/render_buffer_custom_data_rd.h"
@@ -184,6 +185,122 @@ protected:
 	static void _bind_methods();
 
 public:
+	// Optional cumulative participating-medium integral, owned by the compositor.
+	// Reset each render before callbacks so disabled effects never leave stale state.
+	RID cloud_medium;
+	RID cloud_medium_depth;
+	RID cloud_medium_moments;
+	float cloud_medium_far = 0.0f;
+	// Borrowed through completion of the last GPU consumer. Version 2 uses
+	// positive view-Z in meters and 24 compact slots per trace ray.
+	struct CloudDirectTextureInput {
+		RID rid;
+		RD::DataFormat declared_format = RD::DATA_FORMAT_MAX;
+		Vector3i extent;
+		int32_t mipmaps = 0;
+	};
+	struct CloudDirectInputs {
+		static constexpr int32_t ABI_VERSION = 1;
+		static constexpr uint32_t SETTINGS_BYTES = 496;
+		static constexpr uint32_t WEATHER_PAGES_BYTES = 1024;
+		int32_t version = 0;
+		String source_hash;
+		String integration_hash;
+		int32_t eye_index = -1;
+		int32_t eye_count = 0;
+		int64_t allocation_generation = -1;
+		int64_t frame_generation = -1;
+		int64_t weather_generation = -1;
+		int64_t lighting_generation = -1;
+		RID settings_buffer;
+		RID weather_pages_buffer;
+		CloudDirectTextureInput climate_moisture;
+		CloudDirectTextureInput base_noise;
+		CloudDirectTextureInput detail_noise;
+		CloudDirectTextureInput shape_noise;
+		CloudDirectTextureInput local_fog;
+		CloudDirectTextureInput scene_depth;
+		CloudDirectTextureInput weather;
+		CloudDirectTextureInput terrain_sun_global;
+		CloudDirectTextureInput terrain_sun_local;
+		CloudDirectTextureInput solar_current;
+		CloudDirectTextureInput solar_previous;
+		CloudDirectTextureInput atmosphere_optical_depth;
+		// Structural checks alone cannot prove settings semantics, the source
+		// hash, sampler layout, immutable inputs or GPU-use lease. No DIRECT
+		// binding consumes this yet.
+		bool allocations_validated = false;
+		bool settings_header_fields_checked = false;
+		bool settings_semantics_validated = false;
+		bool receiver_compatible = false;
+	};
+	struct CloudMediumCompactDescriptor {
+		int32_t format_version = 0;
+		// Shared across eyes: 3D RGBA16F L/T and R32F view-Z, z = 24 * eye_count.
+		RID lt_texture;
+		RID depth_texture;
+		// Shared SSBOs; ray-map indices are eye * width * height + pixel.
+		RID ray_map;
+		// Shared SSBO pools; L/T is two packed uint words (8 bytes/node), depth is float (4 bytes/node).
+		RID exception_lt_pool;
+		RID exception_depth_pool;
+		// Typed per-eye DIRECT inputs. RIDs remain owner-borrowed; no lease or
+		// native shader binding is granted by storing this descriptor.
+		CloudDirectInputs direct_inputs;
+		Size2i trace_size;
+		Size2i output_size;
+		int32_t eye_index = 0;
+		int32_t eye_count = 0;
+		int32_t candidate_layers = 0;
+		int32_t slot_capacity = 0;
+		int32_t pool_capacity = 0;
+		int64_t allocation_generation = 0;
+		int64_t frame_generation = 0;
+		int64_t weather_generation = 0;
+		int64_t lighting_generation = 0;
+	};
+	Vector<CloudMediumCompactDescriptor> cloud_medium_compact;
+	bool cloud_medium_has_generation = false;
+	int64_t cloud_medium_last_allocation_generation = 0;
+	int64_t cloud_medium_last_frame_generation = 0;
+	int64_t cloud_medium_last_weather_generation = 0;
+	int64_t cloud_medium_last_lighting_generation = 0;
+
+	void clear_cloud_medium_compact() { cloud_medium_compact.clear(); }
+	void set_cloud_medium(RID p_texture, float p_far) {
+		// The legacy entry point selects v1, and an invalid RID disables both ABIs.
+		clear_cloud_medium_compact();
+		cloud_medium = p_texture;
+		cloud_medium_far = p_far;
+		if (!p_texture.is_valid()) {
+			cloud_medium_depth = RID();
+			cloud_medium_moments = RID();
+			cloud_medium_far = 0.0f;
+		}
+	}
+	void set_cloud_medium_depth(RID p_texture) { cloud_medium_depth = p_texture; }
+	void set_cloud_medium_moments(RID p_texture) { cloud_medium_moments = p_texture; }
+	// Each dictionary has format_version, texture/pool RIDs, typed direct_inputs,
+	// sizes, eye/count, capacity and generations. Preflight rejects publication
+	// until source/layout/lease gates exist; no v2 receiver is activated.
+	bool set_cloud_medium_compact_v2(TypedArray<Dictionary> p_eye_descriptors);
+#ifdef DEV_ENABLED
+	// Fixture-only: run the same fail-closed preflight against an isolated
+	// two-eye buffer identity without mutating a live mono viewport.
+	bool debug_validate_cloud_medium_compact_v2_stereo(TypedArray<Dictionary> p_eye_descriptors);
+#endif
+	// Producer-owned RG32F, one 2D-array layer per view: visibility, receiver view depth.
+	RID directional_contact_shadow;
+	Vector3 directional_contact_shadow_direction;
+	void set_directional_contact_shadow(RID p_texture, Vector3 p_direction) {
+		directional_contact_shadow = p_texture;
+		directional_contact_shadow_direction = p_direction.normalized();
+	}
+	RID get_local_fog_texture();
+	Vector2 get_local_fog_range();
+	bool local_fog_medium_capture_requested = false;
+	void request_local_fog_medium_capture(bool p_enabled) { local_fog_medium_capture_requested = p_enabled; }
+	Dictionary get_local_fog_medium_capture();
 	RenderSceneBuffersRD();
 	virtual ~RenderSceneBuffersRD();
 

@@ -1501,6 +1501,18 @@ RID RenderingDevice::storage_buffer_create(uint32_t p_size_bytes, Span<uint8_t> 
 	return id;
 }
 
+bool RenderingDevice::storage_buffer_is_valid(RID p_buffer) const {
+	ERR_RENDER_THREAD_GUARD_V(false);
+	return storage_buffer_owner.owns(p_buffer);
+}
+
+uint32_t RenderingDevice::storage_buffer_get_size(RID p_buffer) {
+	ERR_RENDER_THREAD_GUARD_V(0);
+	const Buffer *buffer = storage_buffer_owner.get_or_null(p_buffer);
+	ERR_FAIL_NULL_V_MSG(buffer, 0, "Storage buffer RID is invalid.");
+	return buffer->size;
+}
+
 RID RenderingDevice::texture_buffer_create(uint32_t p_size_elements, DataFormat p_format, Span<uint8_t> p_data) {
 	uint32_t element_size = get_format_vertex_size(p_format);
 	ERR_FAIL_COND_V_MSG(element_size == 0, RID(), "Format requested is not supported for texture buffers");
@@ -1718,6 +1730,7 @@ RID RenderingDevice::texture_create(const TextureFormat &p_format, const Texture
 	texture.samples = format.samples;
 	texture.allowed_shared_formats = format.shareable_formats;
 	texture.has_initial_data = !data.is_empty();
+	texture.storage_identity_proven = true;
 
 	if (driver->api_trait_get(RDD::API_TRAIT_TEXTURE_OUTPUTS_REQUIRE_CLEARS)) {
 		// Check if a clear for this texture must be performed the first time it's used if the driver requires explicit clears after initialization.
@@ -2916,6 +2929,79 @@ bool RenderingDevice::texture_is_valid(RID p_texture) {
 	ERR_RENDER_THREAD_GUARD_V(false);
 
 	return texture_owner.owns(p_texture);
+}
+
+RenderingDevice::TextureStorageOverlap RenderingDevice::texture_storage_overlap(RID p_first, RID p_second) {
+	ERR_RENDER_THREAD_GUARD_V(TEXTURE_STORAGE_OVERLAP_UNKNOWN);
+
+	const Texture *first = texture_owner.get_or_null(p_first);
+	const Texture *second = texture_owner.get_or_null(p_second);
+	if (first == nullptr || second == nullptr) {
+		return TEXTURE_STORAGE_OVERLAP_UNKNOWN;
+	}
+	if (p_first == p_second) {
+		return TEXTURE_STORAGE_OVERLAP_OVERLAP;
+	}
+
+	// RID_Owner validates the creation generation. Shared views always point
+	// at their root RID; comparing only the view RIDs would miss aliasing.
+	const RID first_root_rid = first->owner.is_valid() ? first->owner : p_first;
+	const RID second_root_rid = second->owner.is_valid() ? second->owner : p_second;
+	const Texture *first_root = texture_owner.get_or_null(first_root_rid);
+	const Texture *second_root = texture_owner.get_or_null(second_root_rid);
+	if (first_root == nullptr || second_root == nullptr || first_root->owner.is_valid() || second_root->owner.is_valid() ||
+			!first_root->storage_identity_proven || !second_root->storage_identity_proven) {
+		return TEXTURE_STORAGE_OVERLAP_UNKNOWN;
+	}
+	// Format-reinterpretation fallbacks can sample a separate mirrored image.
+	// Do not infer a view range through that copy path.
+	if (first->shared_fallback != nullptr || second->shared_fallback != nullptr ||
+			first_root->shared_fallback != nullptr || second_root->shared_fallback != nullptr ||
+			first->slice_type == TEXTURE_SLICE_3D || second->slice_type == TEXTURE_SLICE_3D) {
+		return TEXTURE_STORAGE_OVERLAP_UNKNOWN;
+	}
+	if (first_root_rid != second_root_rid) {
+		return TEXTURE_STORAGE_OVERLAP_DISJOINT;
+	}
+	const auto aspect_mask = [](const Texture *p_texture) {
+		uint32_t mask = 0;
+		if (p_texture->read_aspect_flags.has_flag(RDD::TEXTURE_ASPECT_COLOR_BIT)) {
+			mask |= RDD::TEXTURE_ASPECT_COLOR_BIT;
+		}
+		if (p_texture->read_aspect_flags.has_flag(RDD::TEXTURE_ASPECT_DEPTH_BIT)) {
+			mask |= RDD::TEXTURE_ASPECT_DEPTH_BIT;
+		}
+		if (p_texture->read_aspect_flags.has_flag(RDD::TEXTURE_ASPECT_STENCIL_BIT)) {
+			mask |= RDD::TEXTURE_ASPECT_STENCIL_BIT;
+		}
+		return mask;
+	};
+	const uint32_t first_aspects = aspect_mask(first);
+	if (first_aspects == 0 || first_aspects != aspect_mask(second)) {
+		return TEXTURE_STORAGE_OVERLAP_UNKNOWN;
+	}
+	const auto range_valid = [first_root](const Texture *p_texture) {
+		return p_texture->mipmaps > 0 && p_texture->layers > 0 &&
+				(uint64_t)p_texture->base_mipmap + p_texture->mipmaps <= first_root->mipmaps &&
+				(uint64_t)p_texture->base_layer + p_texture->layers <= first_root->layers;
+	};
+	if (!range_valid(first) || !range_valid(second)) {
+		return TEXTURE_STORAGE_OVERLAP_UNKNOWN;
+	}
+	if (first_root->type == TEXTURE_TYPE_3D) {
+		// A 3D slice's Z interpretation is not represented by base_layer.
+		return first->slice_type == TEXTURE_SLICE_MAX && second->slice_type == TEXTURE_SLICE_MAX ?
+				TEXTURE_STORAGE_OVERLAP_OVERLAP : TEXTURE_STORAGE_OVERLAP_UNKNOWN;
+	}
+	if (first_root->type != TEXTURE_TYPE_2D && first_root->type != TEXTURE_TYPE_2D_ARRAY) {
+		return first->slice_type == TEXTURE_SLICE_MAX && second->slice_type == TEXTURE_SLICE_MAX ?
+				TEXTURE_STORAGE_OVERLAP_OVERLAP : TEXTURE_STORAGE_OVERLAP_UNKNOWN;
+	}
+	const bool mips_intersect = (uint64_t)first->base_mipmap < (uint64_t)second->base_mipmap + second->mipmaps &&
+			(uint64_t)second->base_mipmap < (uint64_t)first->base_mipmap + first->mipmaps;
+	const bool layers_intersect = (uint64_t)first->base_layer < (uint64_t)second->base_layer + second->layers &&
+			(uint64_t)second->base_layer < (uint64_t)first->base_layer + first->layers;
+	return mips_intersect && layers_intersect ? TEXTURE_STORAGE_OVERLAP_OVERLAP : TEXTURE_STORAGE_OVERLAP_DISJOINT;
 }
 
 RD::TextureFormat RenderingDevice::texture_get_format(RID p_texture) {
@@ -9063,6 +9149,7 @@ void RenderingDevice::_bind_methods() {
 
 	ClassDB::bind_method(D_METHOD("texture_is_shared", "texture"), &RenderingDevice::texture_is_shared);
 	ClassDB::bind_method(D_METHOD("texture_is_valid", "texture"), &RenderingDevice::texture_is_valid);
+	ClassDB::bind_method(D_METHOD("texture_storage_overlap", "first", "second"), &RenderingDevice::texture_storage_overlap);
 
 	ClassDB::bind_method(D_METHOD("texture_set_discardable", "texture", "discardable"), &RenderingDevice::texture_set_discardable);
 	ClassDB::bind_method(D_METHOD("texture_is_discardable", "texture"), &RenderingDevice::texture_is_discardable);
@@ -9106,6 +9193,8 @@ void RenderingDevice::_bind_methods() {
 
 	ClassDB::bind_method(D_METHOD("uniform_buffer_create", "size_bytes", "data", "creation_bits"), &RenderingDevice::_uniform_buffer_create, DEFVAL(Vector<uint8_t>()), DEFVAL(0));
 	ClassDB::bind_method(D_METHOD("storage_buffer_create", "size_bytes", "data", "usage", "creation_bits"), &RenderingDevice::_storage_buffer_create, DEFVAL(Vector<uint8_t>()), DEFVAL(0), DEFVAL(0));
+	ClassDB::bind_method(D_METHOD("storage_buffer_is_valid", "buffer"), &RenderingDevice::storage_buffer_is_valid);
+	ClassDB::bind_method(D_METHOD("storage_buffer_get_size", "buffer"), &RenderingDevice::storage_buffer_get_size);
 	ClassDB::bind_method(D_METHOD("texture_buffer_create", "size_bytes", "format", "data"), &RenderingDevice::_texture_buffer_create, DEFVAL(Vector<uint8_t>()));
 
 	ClassDB::bind_method(D_METHOD("uniform_set_create", "uniforms", "shader", "shader_set"), &RenderingDevice::_uniform_set_create);
@@ -9561,6 +9650,9 @@ void RenderingDevice::_bind_methods() {
 	BIND_ENUM_CONSTANT(TEXTURE_SLICE_2D);
 	BIND_ENUM_CONSTANT(TEXTURE_SLICE_CUBEMAP);
 	BIND_ENUM_CONSTANT(TEXTURE_SLICE_3D);
+	BIND_ENUM_CONSTANT(TEXTURE_STORAGE_OVERLAP_UNKNOWN);
+	BIND_ENUM_CONSTANT(TEXTURE_STORAGE_OVERLAP_DISJOINT);
+	BIND_ENUM_CONSTANT(TEXTURE_STORAGE_OVERLAP_OVERLAP);
 
 	BIND_ENUM_CONSTANT(SAMPLER_FILTER_NEAREST);
 	BIND_ENUM_CONSTANT(SAMPLER_FILTER_LINEAR);

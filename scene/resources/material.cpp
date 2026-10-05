@@ -1798,7 +1798,21 @@ void fragment() {)";
 
 	// If the depth buffer is lower then the model's Z position, use the refracted UV, otherwise use the normal screen UV.
 	// At low depth differences, decrease refraction intensity to avoid sudden discontinuities.
-	EMISSION += textureLod(screen_texture, mix(SCREEN_UV, ref_ofs, smoothstep(0.0, 1.0, VERTEX.z - refraction_view_pos.z)), ROUGHNESS * 8.0).rgb * ref_amount * EXPOSURE;
+	vec2 transmission_uv = mix(SCREEN_UV, ref_ofs, smoothstep(0.0, 1.0, VERTEX.z - refraction_view_pos.z));
+	vec3 transmission_color = textureLod(screen_texture, transmission_uv, ROUGHNESS * 8.0).rgb * ref_amount;
+)";
+		if (OS::get_singleton()->get_current_rendering_method() == "forward_plus") {
+			code += R"(
+	MEDIUM_TRANSMITTED_RADIANCE = transmission_color;
+	MEDIUM_TRANSMITTED_WEIGHT = vec3(ref_amount);
+	MEDIUM_TRANSMITTED_UV = transmission_uv;
+)";
+		} else {
+			code += R"(
+	EMISSION += transmission_color * EXPOSURE;
+)";
+		}
+		code += R"(
 	ALBEDO *= 1.0 - ref_amount;
 	// Force transparency on the material (required for refraction).
 	ALPHA = 1.0;
